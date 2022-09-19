@@ -1,0 +1,2066 @@
+gradle-dockerfile
+----------
+
+#FROM maven:3.8.4-openjdk-17 as build
+FROM gradle:7.5.0-jdk11-jammy as build
+COPY . /build-project
+WORKDIR /build-project
+RUN gradle clean build
+FROM openjdk:11
+EXPOSE 8080
+COPY --from=build /build-project/build/libs/cse-0.0.1-SNAPSHOT.jar /app.jar
+ENTRYPOINT ["java","-jar", "/app.jar"]
+HEALTHCHECK \
+#     NONE
+    --start-period=1s \
+    --interval=10s \
+    --timeout=1s \
+    --retries=30 \
+        CMD curl --fail -s http://localhost:8080/hello || exit 1
+
+-------------------------------------------
+version: "3.9"
+networks:  
+  default:
+    name: my-bridge-network
+    external: true
+    
+services:
+  app:
+    build: .
+    environment:
+      VAULT_ADDRESS: http://vault:8200
+      VAULT_APPROLE_ROLE_ID: demo-web-app
+    ports:
+      - "8080:8080"
+    volumes:
+      - my-test-vol:/vault-data:ro
+  # a dummy service which blocks "docker compose up -d" from returning until all services are up & healthy
+  healthy:
+    image: alpine:latest
+    command: [ "echo", "all services are up & healthy" ]
+    depends_on:
+      app:
+        condition: service_healthy
+volumes:
+  my-test-vol:
+    external: true
+----------------------------------
+plugins {
+	id 'org.springframework.boot' version '2.7.2'
+	id 'io.spring.dependency-management' version '1.0.12.RELEASE'
+	id 'java'
+}
+group = 'com.persistent.acds'
+version = '0.0.1-SNAPSHOT'
+sourceCompatibility = '11'
+repositories {
+	mavenCentral()
+}
+dependencies {
+	implementation 'org.springframework.boot:spring-boot-starter-web'
+	testImplementation 'org.springframework.boot:spring-boot-starter-test'
+	implementation 'org.springframework.vault:spring-vault-core:2.3.1'
+}
+tasks.named('test') {
+	useJUnitPlatform()
+}
+----------------------------------------
+# take python 3.9 as base image
+FROM python:3.9.1
+# install all dependencies
+RUN pwd
+WORKDIR /tmp
+COPY requirements.txt ./
+RUN pip install -r requirements.txt
+#TODO:copy required files
+WORKDIR /opt/acds-playbook
+COPY .env ./
+COPY ACDS-playbook.py ./
+COPY ACDS_alerter.py ./
+COPY ACDS-generic.template ./
+#COPY src/convertors ./convertors
+#COPY src/config ./config
+#COPY src/es-tip-client.ini ./
+RUN pwd
+RUN ls -a
+# RUN ls -a /so_alerter
+ENV ES_HOST=10.254.12.12
+ENV ES_PORT=9200
+# copy source files to the workdir
+CMD python3 ACDS-playbook.py -eh ${ES_HOST} -ep ${ES_PORT}
+-------------------------------------------------------------
+
+if [ $# -lt 2 ]; then 
+    echo "Deployment script should be used as : ./deploy_so_acds_playbook.sh <ES_HOST> <ES_PORT>" $#
+    exit 
+fi
+CONTAINER_NAME=acds_playbook_app
+echo "Uninstalling the exisiting setup...."
+# Run this script to deploy the load the docker image of the es-tip-client
+# But before that do the cleanup
+sudo docker container stop $CONTAINER_NAME
+# remove all es_tip_client
+sudo docker container rm $CONTAINER_NAME
+# remove es_tip_client images
+sudo docker rmi -f $(sudo docker images -f "reference=docker.acds.net.in/aes/acds_playbook" -q)
+# remove data volume, but before that remove unused containers, volumes etc.
+# sudo docker system prune -a
+sudo docker volume rm $(sudo docker volume ls --filter="name=playbook_data" -q)
+#remove mounted volume
+sudo rm -rf /tmp/alert_data
+echo "Installing ACDS-playbook..."
+# !!!!! IMPORTANT !!!!!!
+# Note that this version needs to be updated, if the version in the Makefile has changed as well.
+IMAGE_VERSION=0.1
+IMAGE_NAME=acds_playbook
+TIME_ZONE='Asia/Kolkata'
+# Execute the run command
+sudo docker run -e TZ=$TIME_ZONE -v /tmp/alert_data:/playbook_data -v /opt/so/rules/elastalert:/elastalert_rules -v /opt/so/conf/elastalert/modules/custom:/so_alerter -e ES_HOST=$1 -e ES_PORT=$2 --name $CONTAINER_NAME -d docker.acds.net.in/aes/$IMAGE_NAME:v$IMAGE_VERSION
+---------------------------------------
+
+# !!!!! IMPORTANT !!!!!!
+# Update this version in deploy/deploy.sh
+IMAGE_VERSION = 0.1
+IMAGE_NAME = acds_playbook
+TIME_ZONE = 'Asia/Kolkata'
+CONTAINER_NAME = acds_playbook_app
+build_docker:
+	sudo docker build -t $(IMAGE_NAME):v$(IMAGE_VERSION) -f Dockerfile .
+build_dkrreg:
+	sudo docker build -t docker.acds.net.in/aes/$(IMAGE_NAME):v$(IMAGE_VERSION) -f Dockerfile .
+	
+# move the run command in the deploy script
+run_docker:
+	sudo docker run -e TZ=$(TIME_ZONE) -v /tmp/alert_data/elastalert_rules:/elastalert_rules --name $(CONTAINER_NAME) -d docker.acds.net.in/aes/$(IMAGE_NAME):v$(IMAGE_VERSION)
+run_docker_so:
+	sudo docker run -e TZ=$(TIME_ZONE) -v /tmp/alert_data:/data -v /opt/so/rules/elastalert:/elastalert_rules -v /opt/so/saltstack/local/salt/elastalert/files/modules/so:/so_alerter -e ES_HOST=10.254.12.12 -e ES_PORT=9200 --name $(CONTAINER_NAME) -d docker.acds.net.in/aes/$(IMAGE_NAME):v$(IMAGE_VERSION)
+# elastalert -> /opt/so/rules/elastalert
+# snort,suricata -> /opt/so/saltstack/local/salt/idstools/
+# zeek -> /opt/so/saltstack/local/salt/zeek/policy/intel/
+# list volumes
+# sudo docker volume ls --format "{{.Name}}: {{.Driver}} : {{.Mountpoint}}"
+clean_docker:
+	sudo docker stop $(CONTAINER_NAME)
+	sudo docker rm $(CONTAINER_NAME)
+save_docker:
+	sudo docker save $(IMAGE_NAME):v$(IMAGE_VERSION) | gzip > $(IMAGE_NAME)_v$(IMAGE_VERSION).tar.gz
+save_dkrreg:
+	sudo docker save docker.acds.net.in/aes/$(IMAGE_NAME):v$(IMAGE_VERSION) | gzip > -$(IMAGE_NAME)_v$(IMAGE_VERSION).tar.gz
+push_reg:
+	sudo docker login docker.acds.net.in
+	sudo docker push docker.acds.net.in/aes/$(IMAGE_NAME):v$(IMAGE_VERSION)
+
+------------------------------------------------------
+FROM python:3.9
+LABEL version="0.5.2"
+LABEL description="This container makes Linux Lateral Movement Detection in terms of Severity for given CSV file"
+WORKDIR /home/linuxlateralmovement
+COPY requirements.txt requirements.txt
+RUN pip3 install -r requirements.txt
+COPY *.py /home/linuxlateralmovement/
+COPY settings.toml /home/linuxlateralmovement/
+ENV INPUT_CSV_PATH=
+CMD python detection.py -csv ${INPUT_CSV_PATH}
+
+-------------------------------------------------------
+RELEASE_DIR = /data/workspace/AIML/EndpointSecurity/LateralMovement/LinuxLateralMovement/src/DAG
+RELEASE_DIR2 = /data/workspace/AIML/EndpointSecurity/LateralMovement/LinuxLateralMovement/src/DockerImages
+RELEASE_DIR3 = /data/workspace/AIML/release
+DOCKER_REGISTRY = docker.acds.net.in
+TIME_STAMP=$(BUILD_TIMESTAMP)
+OUT_DIR_RELEASE=/data/workspace/AIML/release_$(MODULE_NAME)_$(BUILD_NUMBER)_$(TIME_STAMP)
+#Build Variables
+IMAGE_NAME = ${DOCKER_REGISTRY}/testaiml/linux_lateral_movement/detection
+DOCKERFILE_PATH = .
+ifneq ($(BUILD_NUMBER),)
+VERSION=$(BUILD_NUMBER)
+else
+VERSION=latest
+endif
+push: login build
+	${info Pushing Docker Image to Registry}
+	docker push ${IMAGE_NAME}:${VERSION}
+login:
+	docker login ${DOCKER_REGISTRY}
+build-local:
+	${info Building Docker Image}
+	sudo docker build -t ${IMAGE_NAME}:${VERSION} ${DOCKERFILE_PATH}
+	
+build:
+	sed -i '/VERSION/c\' $(RELEASE_DIR2)/.env
+	echo VERSION=$(VERSION) >> $(RELEASE_DIR2)/.env
+	${info Building Docker Image}
+	docker build -t ${IMAGE_NAME}:${VERSION} ${DOCKERFILE_PATH}
+	mkdir -p $(OUT_DIR_RELEASE);
+	rm -rf $(OUT_DIR_RELEASE)/*
+	cp -r $(RELEASE_DIR)/* $(RELEASE_DIR2)/settings.toml $(RELEASE_DIR3)/* $(RELEASE_DIR2)/.env $(OUT_DIR_RELEASE)/;
+clean:
+	echo "Clean Up the docker build images"
+	docker rmi ${IMAGE_NAME}:${VERSION}
+	echo "Cleaned up all the docker build images"
+#Run Varibales, change paths to where db file exists.
+MNT_SRC = None
+MNT_DST = /Linux_Lateral
+INPUT_CSV_PATH = None
+run:
+ifeq (${MNT_SRC},None)
+	${error MNT_SRC path is not set in Makefile, please make sure all paths are set correctly}
+else ifeq (${INPUT_CSV_PATH},None)
+	${error INPUT_CSV_PATH path is not set in Makefile, please make sure all paths are set correctly}
+else
+	${info Running Docker Container}
+	docker run -it -v ${MNT_SRC}:${MNT_DST} -e INPUT_CSV_PATH=${INPUT_CSV_PATH} ${IMAGE_NAME}:${VERSION}
+	${info If it gave error, make sure if you have set correct paths}
+endif
+
+------------------------------------------------------
+# Using latest kong image
+ARG BASEIMAGE
+FROM ${BASEIMAGE}
+# Installing packages required for plugin dev kit
+USER root
+RUN apk add --no-cache python3 py3-pip gcc python3-dev musl-dev build-base libffi-dev
+RUN ln -sf python3 /usr/bin/python
+RUN /usr/bin/pip3 install kong-pdk watchdog
+# Create required folders and copy files
+RUN mkdir -p /usr/local/kong/python-plugins
+COPY plugins/rbac_elastic/py-rbac-elastic.py /usr/local/kong/python-plugins/py-rbac-elastic.py
+COPY plugins/rbac_elastic/rbac_elastic.py /usr/local/kong/python-plugins/rbac_elastic.py
+COPY plugins/rbac_elastic/conf/elastic_rbac_conf.json /home/kong/elastic_rbac_conf.json
+COPY plugins/rbac_elastic/conf/elastic_auth.json /home/kong/elastic_auth.json
+COPY kong.conf /etc/kong/kong.conf
+COPY certs/cert.crt /etc/kong/cert.crt
+COPY certs/cert.key /etc/kong/cert.key
+COPY fileWatcher.py /home/fileWatcher.py
+RUN chmod 777 /etc/kong/cert.crt
+RUN chmod 777 /etc/kong/cert.key
+# Update permissions of plugin files
+RUN chmod o+rx /usr/local/kong/python-plugins/py-rbac-elastic.py
+RUN chmod o+rx /usr/local/kong/python-plugins/rbac_elastic.py
+# Switch to default user
+USER kong
+------------------------------------------
+DOCKER_DIR=.
+TIME_STAMP=$(BUILD_TIMESTAMP)
+OUT_DIR_RELEASE=release_$(MODULE_NAME)_$(BUILD_NUMBER)_$(TIME_STAMP)
+ACDS_DOCKER_REGISTRY=docker.acds.net.in/apigateway
+MODULE_NAME=apigateway
+DOCKER_USER=$(ACDS_DOCKER_CREDS_USR)
+DOCKER_PWD=$(ACDS_DOCKER_CREDS_PSW)
+BUILD=$(BUILD_NUMBER)
+ifneq ($(BUILD),)
+ACDS_APIGATEWAY_VERSION=$(BUILD)
+else
+ACDS_APIGATEWAY_VERSION=latest
+endif
+.PHONY: all package clean build docker-build docker-push-image docker-clean-image docker-clean-local
+all: clean build
+build:
+	echo "Starting build $(BUILD)"
+	rm -rf release_*
+	mkdir -p $(OUT_DIR_RELEASE);
+docker-build:
+	sed -i '/ACDS_APIGATEWAY_VERSION/c\' $(DOCKER_DIR)/.env
+	echo ACDS_APIGATEWAY_VERSION=$(ACDS_APIGATEWAY_VERSION) >> $(DOCKER_DIR)/.env
+	docker-compose -f $(DOCKER_DIR)/docker-compose.yml -f $(DOCKER_DIR)/docker-compose.build.yml build
+	rm -rf $(OUT_DIR_RELEASE)/*
+	cp -r $(DOCKER_DIR)/kong_reload.sh $(DOCKER_DIR)/deploy_kong.sh $(DOCKER_DIR)/docker-compose.yml $(DOCKER_DIR)/add_elastic_service.sh $(DOCKER_DIR)/.env $(DOCKER_DIR)/plugins/rbac_elastic/conf $(OUT_DIR_RELEASE)/;
+docker-push-image:
+	echo "Pushing docker images to registry...."
+	
+	docker push $(ACDS_DOCKER_REGISTRY)/kong:${ACDS_APIGATEWAY_VERSION}
+	
+	echo "Images successfully pushed to registry."
+docker-clean-image:
+	echo "Clean Up the docker build images"
+	docker rmi $(ACDS_DOCKER_REGISTRY)/kong:${ACDS_APIGATEWAY_VERSION}
+docker-clean-local:
+	echo "Clean Up the docker build images"
+	docker rmi kong:${ACDS_APIGATEWAY_VERSION}
+deploy:
+	echo "deploy stage"
+	docker version
+-----------------------------------------------------
+pipeline {
+    agent any
+    environment {
+                JAVA_TOOL_OPTIONS = "-Duser.home=/var/maven"
+            }
+    stages{
+       
+        stage ('Build'){
+             environment {
+                JAVA_TOOL_OPTIONS = "-Duser.home=/var/maven"
+            }
+            
+            steps{
+                sh 'make build'
+                sh 'make docker-build'
+                sh 'make docker-push-image'
+                
+            }
+            post {
+                always {
+                    echo 'Archiving artifacts'
+                    archiveArtifacts artifacts: 'release_*/', onlyIfSuccessful: true
+                    echo 'Clean Up action'
+                    
+                    sh 'make docker-clean-image'
+                   
+                }
+            }
+               
+        }
+    }
+    post { 
+        always { 
+            echo 'Clean Up action'
+            cleanWs()
+        }
+    }
+}
+
+-----------------------------------------------
+
+version: '3.5'
+services:
+  kong:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+      args:
+       BASEIMAGE: ${REGISTRY}/kong/kong-gateway:2.8.1.1-alpine
+----------------------------------------------
+
+REGISTRY=docker.acds.net.in/dockerhubproxy
+
+------------------------------------------------
+# Build tools docker file
+FROM maven:3.8.2-openjdk-11-slim
+RUN apt-get update && apt-get install -y make ca-certificates curl gnupg lsb-release
+RUN curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+RUN echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/debian \
+  $(lsb_release -cs) stable" |  tee /etc/apt/sources.list.d/docker.list > /dev/null
+RUN apt-get update && apt-get install -y docker-ce-cli
+RUN curl -k -L "https://github.com/docker/compose/releases/download/1.29.2/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+RUN chmod +x /usr/local/bin/docker-compose
+-----------------------------------------------------
+DOCKER_DIR = docker
+TIME_STAMP=$(BUILD_TIMESTAMP)
+OUT_DIR=release_pm_$(BUILD_NUMBER)_$(TIME_STAMP)
+ACDS_DOCKER_REGISTRY=docker.acds.net.in/pm
+ifneq ($(BUILD_NUMBER),)
+ACDS_PM_VERSION=$(BUILD_NUMBER)
+else
+ACDS_PM_VERSION=latest
+endif
+.PHONY: all package clean build docker-build docker-push-image docker-clean-image docker-clean-local
+all:
+	mvn clean package
+package:
+	mvn package
+clean:
+	mvn clean
+build:
+	mkdir -p $(OUT_DIR);
+	mvn clean install
+	cp ./target/PolicyManager.war $(OUT_DIR)/
+docker-build:
+	sed -i '/ACDS_PM_VERSION/c\' $(DOCKER_DIR)/.env
+	echo ACDS_PM_VERSION=$(ACDS_PM_VERSION) >> $(DOCKER_DIR)/.env
+	docker-compose -f $(DOCKER_DIR)/docker-compose.yml -f $(DOCKER_DIR)/docker-compose.build.yml build
+	cp -r  $(DOCKER_DIR)/deploy_pm.sh $(DOCKER_DIR)/.env $(DOCKER_DIR)/docker-compose.yml $(DOCKER_DIR)/server.xml $(DOCKER_DIR)/ssl $(DOCKER_DIR)/docker-volume $(OUT_DIR)/
+docker-push-image:
+	echo "Pushing docker images to registry...."
+	docker push $(ACDS_DOCKER_REGISTRY)/policymanager:$(ACDS_PM_VERSION)
+	echo "Images successfully pushed to registry."
+docker-clean-image:
+	echo "Clean Up the docker build images"
+	docker rmi $(ACDS_DOCKER_REGISTRY)/policymanager:$(ACDS_PM_VERSION)
+docker-clean-local:
+	echo "Clean Up the docker build images"
+	docker rmi policymanager:$(ACDS_PM_VERSION)
+docker-release : build docker-build docker-push-image
+--------------------------------
+#!groovy
+pipeline {
+    agent any
+    stages {
+        stage('Build') {
+            environment {
+                JAVA_TOOL_OPTIONS = "-Duser.home=/var/maven"
+            }
+            agent { 
+                dockerfile  {
+                    filename 'Dockerfile.build'
+                    args '-v /var/run/docker.sock:/var/run/docker.sock:rw -v $HOME/.docker/config.json:/.docker/config.json -v $HOME/.m2:/var/maven/.m2 -e MAVEN_CONFIG=/var/maven/.m2'
+                    reuseNode true
+                }
+            }
+            steps {
+                sh 'make docker-release'
+            }
+            post { 
+                always {
+                    echo 'Archiving artifacts'
+                    archiveArtifacts artifacts: 'release_*/', onlyIfSuccessful: true
+                    sh 'make docker-clean-image' 
+                }
+            }
+        }
+        stage('Deploy') {
+            steps {
+                echo 'Deploy Stage' 
+            }
+        }
+    }
+    post {
+        always { 
+            echo 'Clean Up action'
+            cleanWs()
+        }
+    }
+}
+----------------------------------------------------
+FROM tomcat:10.0.20-jre11-openjdk-slim
+COPY  ./target/PolicyManager.war /usr/local/tomcat/webapps/
+EXPOSE 8080 8443
+
+---------------------------------------------------------
+version: '3.5'
+services:
+  web:
+    build: 
+      context: ../
+      dockerfile: ./docker/Dockerfile
+
+----------------------------------------------------
+version: '3.5'
+services:
+  web:
+    container_name : policy_manager
+    image: ${ACDS_DOCKER_REGISTRY}policymanager:${ACDS_PM_VERSION}
+    ports:
+      - "${TOMCAT_PORT}:8080"
+      - "${TOMCAT_PORT_SSL}:8443"
+    extra_hosts : 
+      - "es01:${ES_HOST_IP}"
+    volumes:
+      - ./ssl:/usr/local/tomcat/ssl
+      - ./server.xml:/usr/local/tomcat/conf/server.xml
+      - ./docker-volume:/policymanager-volume
+
+-------------------------------------------------------
+#!/bin/sh
+TIMESCALE_DB_SLEEP=10s
+if [ $# -lt 1 ]; then 
+    echo "Usage : ./deploy_rm.sh <environment file>" $#
+    exit 
+fi
+ENVFILE=$1
+# stop all containers
+docker container stop $(docker container ls | grep rmCalculation | awk '{print $1}')
+docker container stop $(docker container ls | grep reportparser | awk '{print $1}')
+docker container stop $(docker container ls | grep sdlDataAggregator | awk '{print $1}')
+docker container stop $(docker container ls | grep timescale | awk '{print $1}')
+# remove all containers
+docker container rm $(docker container ls -a | grep rmCalculation | awk '{print $1}')
+docker container rm $(docker container ls -a | grep reportparser | awk '{print $1}')
+docker container rm $(docker container ls -a | grep sdlDataAggregator | awk '{print $1}')
+docker container rm $(docker container ls -a | grep timescale | awk '{print $1}')
+# remove all images
+docker rmi -f $(docker images | grep rmcalculation | awk '{print $3}')
+docker rmi -f $(docker images | grep reportparser | awk '{print $3}')
+docker rmi -f $(docker images | grep sdldataaggregator | awk '{print $3}')
+docker rmi -f $(docker images | grep timescaledb | awk '{print $3}')
+# remove all volumes
+echo "Deploying Timescale DB"
+docker-compose --env-file $ENVFILE up --no-build -d timescaleDb
+sleep $TIMESCALE_DB_SLEEP
+echo "Deploying Risk Manager"
+sysctl -w vm.max_map_count=262144
+docker-compose --env-file $ENVFILE up --no-build -d reportparser rmCalculation sdlDataAggregator
+echo "Risk Manager instance now running"
+
+-----------------------------------------------------
+
+#!groovy
+pipeline {
+    agent any
+    stages {
+        stage('Build') {
+            steps {
+                sh 'make -C ./SCC build env="--prod"'
+                sh 'make -C ./SCC docker-push-image env="--prod"'
+                sh 'make -C "./Risk Manager" build'
+                sh 'make -C "./Risk Manager" docker-push-image'
+            }
+            post { 
+                always {
+                    echo 'Archiving artifacts'
+                    archiveArtifacts artifacts: 'SCC/release/, "Risk Manager/rm-release/"', onlyIfSuccessful: true 
+                    echo 'Clean Up action'
+                    sh 'chmod +x ./SCC/cleanup.sh'
+                    sh './SCC/cleanup.sh'
+                }
+            }
+        }
+    }
+    post { 
+            always {
+                    cleanWs()
+                    emailext ( 
+                    body: "More info at: ${env.BUILD_URL}", 
+                    subject: "${env.JOB_NAME}: ${env.BUILD_NUMBER} : ${currentBuild.currentResult}", 
+                    to: 'apoorva_ganu@acds.net.in,manoj_modak@acds.net.in' 
+                    ) 
+                }
+        }
+}
+-----------------------------------------------
+SHELL = /bin/sh
+BUILD=v1
+BUILD_DIR=build
+DOCKER_DIR=scc-docker
+# TMP_DOCKER_DIR=scc-tmp-docker
+OUT_DIR=release
+SCC_TAR=SCC_v1.tar.gz
+ACDS_REGISTRY=docker.acds.net.in/scc
+ifneq ($(BUILD_NUMBER),)
+ACDS_SCC_VERSION=$(BUILD_NUMBER)
+else
+ACDS_SCC_VERSION=latest
+endif
+REACT_APP_MODE=ENTITY
+REACT_APP_HOST=scc-dev.acds.net.in
+REACT_APP_BASE_PATH=/scc
+REACT_APP_SERVER_BASE_PATH=https://scc-dev.acds.net.in:8443/scc
+REACT_APP_ATTACK_NAVIGATOR_URL=https://securityonionscc.acds.net.in/navigator/
+REACT_APP_NETWORK_DASHBOARD_URL="https://securityonionscc.acds.net.in/kibana/app/dashboards\#/view/04ff3ef0-6ea4-11ea-9266-1fd14ca6af34?embed=true&_g=(filters%3A!()%2CrefreshInterval%3A(pause%3A!t%2Cvalue%3A0)%2Ctime%3A(from%3Anow-24h%2Cto%3Anow))&show-time-filter=true"
+REACT_APP_ENDPOINT_DASHBOARD_URL="https://securityonionscc.acds.net.in/kibana/app/dashboards\#/view/92e63cc0-6ec0-11ea-9266-1fd14ca6af34?embed=true&_g=(filters%3A!()%2CrefreshInterval%3A(pause%3A!t%2Cvalue%3A0)%2Ctime%3A(from%3Anow-24h%2Cto%3Anow))&show-time-filter=true"
+REACT_APP_MISP_URL=https://scc-tip.acds.net.in/events/index
+REACT_APP_SO_ALERTS_URL="https://securityonionscc.acds.net.in/\#/alerts?embed=true&"
+REACT_APP_RISK_REPORT_URL="https://scc-rm.acds.net.in:5601/app/dashboards\#/view/2f4a3750-859f-11ec-9d61-271b2a94009b?embed=true&_g=(filters%3A!())"
+REACT_APP_CONFIG_COMPLIANCE_REPORT_URL="https://scc-rm.acds.net.in:5601/app/dashboards\#/view/e02acee0-8581-11ec-9d61-271b2a94009b?embed=true&_g=(filters%3A!())&show-time-filter=true"
+REACT_APP_VULNERABILITY_REPORT_URL="https://scc-rm.acds.net.in:5601/app/dashboards\#/view/7c7a7260-859a-11ec-9d61-271b2a94009b?embed=true&_g=(filters%3A!())&show-time-filter=true"
+REACT_APP_POLICY_MANAGER_API_SERVER=https://scc-pm.acds.net.in:883/PolicyManager
+REACT_APP_SOAR_URL=https://thehive.acds.net.in:8443/
+REACT_APP_CORTEX_URL=https://cortex.acds.net.in:8443/
+REACT_APP_LOGIN_TIMEOUT=30
+ifeq ($(env), --prod)
+	ENV_FILE:='.env.prod'
+else
+	ENV_FILE:='.env'
+endif
+all: clean build
+clean:
+	sudo rm -rf $(BUILD_DIR);
+	# [ -e $(TMP_DOCKER_DIR)/docker-compose.yml ] && ( cd $(TMP_DOCKER_DIR); docker-compose down -v --rmi all --remove-orphans; echo SUCCESS ) || echo "No docker-compose.yml to clean"
+	# # Remove temp docker folder
+	# sudo rm -rf $(TMP_DOCKER_DIR)
+	echo $(env)
+	if [ "$(env)" = "--prod" ]; then \
+		sudo docker-compose -f docker-compose.yml -f docker-compose-scc.prod.yml --env-file $(DOCKER_DIR)/.env.prod down -v --rmi all --remove-orphans; \
+	else \
+		sudo docker-compose down -v --rmi local --remove-orphans; \
+	fi
+build:
+	echo "Starting SCC build #${BUILD}"
+	mkdir -p $(BUILD_DIR); 
+	mkdir -p $(OUT_DIR);
+	# cp -a $(DOCKER_DIR) $(TMP_DOCKER_DIR); 
+	# cd $(TMP_DOCKER_DIR);  docker-compose up -d
+	echo $(ENV_FILE)
+	sed -i '/REACT_APP_MODE/c\' $(DOCKER_DIR)/$(ENV_FILE)
+	echo REACT_APP_MODE=$(REACT_APP_MODE) >> $(DOCKER_DIR)/$(ENV_FILE)
+	sed -i '/REACT_APP_HOST/c\' $(DOCKER_DIR)/$(ENV_FILE)
+	echo REACT_APP_HOST=$(REACT_APP_HOST) >> $(DOCKER_DIR)/$(ENV_FILE)
+	sed -i '/REACT_APP_BASE_PATH/c\' $(DOCKER_DIR)/$(ENV_FILE)
+	echo REACT_APP_BASE_PATH=$(REACT_APP_BASE_PATH) >> $(DOCKER_DIR)/$(ENV_FILE)
+	sed -i '/REACT_APP_SERVER_BASE_PATH/c\' $(DOCKER_DIR)/$(ENV_FILE)
+	echo REACT_APP_SERVER_BASE_PATH=$(REACT_APP_SERVER_BASE_PATH) >> $(DOCKER_DIR)/$(ENV_FILE)
+	sed -i '/REACT_APP_ATTACK_NAVIGATOR_URL/c\' $(DOCKER_DIR)/$(ENV_FILE)
+	echo REACT_APP_ATTACK_NAVIGATOR_URL=$(REACT_APP_ATTACK_NAVIGATOR_URL) >> $(DOCKER_DIR)/$(ENV_FILE)
+	sed -i '/REACT_APP_NETWORK_DASHBOARD_URL/c\' $(DOCKER_DIR)/$(ENV_FILE)
+	echo REACT_APP_NETWORK_DASHBOARD_URL=$(REACT_APP_NETWORK_DASHBOARD_URL) >> $(DOCKER_DIR)/$(ENV_FILE)
+	sed -i '/REACT_APP_ENDPOINT_DASHBOARD_URL/c\' $(DOCKER_DIR)/$(ENV_FILE)
+	echo REACT_APP_ENDPOINT_DASHBOARD_URL=$(REACT_APP_ENDPOINT_DASHBOARD_URL) >> $(DOCKER_DIR)/$(ENV_FILE)
+	sed -i '/REACT_APP_MISP_URL/c\' $(DOCKER_DIR)/$(ENV_FILE)
+	echo REACT_APP_MISP_URL=$(REACT_APP_MISP_URL) >> $(DOCKER_DIR)/$(ENV_FILE)
+	sed -i '/REACT_APP_SO_ALERTS_URL/c\' $(DOCKER_DIR)/$(ENV_FILE)
+	echo REACT_APP_SO_ALERTS_URL=$(REACT_APP_SO_ALERTS_URL) >> $(DOCKER_DIR)/$(ENV_FILE)
+	sed -i '/REACT_APP_RISK_REPORT_URL/c\' $(DOCKER_DIR)/$(ENV_FILE)
+	echo REACT_APP_RISK_REPORT_URL=$(REACT_APP_RISK_REPORT_URL) >> $(DOCKER_DIR)/$(ENV_FILE)
+	sed -i '/REACT_APP_CONFIG_COMPLIANCE_REPORT_URL/c\' $(DOCKER_DIR)/$(ENV_FILE)
+	echo REACT_APP_CONFIG_COMPLIANCE_REPORT_URL=$(REACT_APP_CONFIG_COMPLIANCE_REPORT_URL) >> $(DOCKER_DIR)/$(ENV_FILE)
+	sed -i '/REACT_APP_VULNERABILITY_REPORT_URL/c\' $(DOCKER_DIR)/$(ENV_FILE)
+	echo REACT_APP_VULNERABILITY_REPORT_URL=$(REACT_APP_VULNERABILITY_REPORT_URL) >> $(DOCKER_DIR)/$(ENV_FILE)
+	sed -i '/REACT_APP_POLICY_MANAGER_API_SERVER/c\' $(DOCKER_DIR)/$(ENV_FILE)
+	echo REACT_APP_POLICY_MANAGER_API_SERVER=$(REACT_APP_POLICY_MANAGER_API_SERVER) >> $(DOCKER_DIR)/$(ENV_FILE)
+	sed -i '/REACT_APP_SOAR_URL/c\' $(DOCKER_DIR)/$(ENV_FILE)
+	echo REACT_APP_SOAR_URL=$(REACT_APP_SOAR_URL) >> $(DOCKER_DIR)/$(ENV_FILE)
+	sed -i '/REACT_APP_CORTEX_URL/c\' $(DOCKER_DIR)/$(ENV_FILE)
+	echo REACT_APP_CORTEX_URL=$(REACT_APP_CORTEX_URL) >> $(DOCKER_DIR)/$(ENV_FILE)
+	sed -i '/REACT_APP_LOGIN_TIMEOUT/c\' $(DOCKER_DIR)/$(ENV_FILE)
+	echo REACT_APP_LOGIN_TIMEOUT=$(REACT_APP_LOGIN_TIMEOUT) >> $(DOCKER_DIR)/$(ENV_FILE)
+	sed -i '/ACDS_SCC_VERSION/c\' $(DOCKER_DIR)/$(ENV_FILE)
+	echo ACDS_SCC_VERSION=$(ACDS_SCC_VERSION) >> $(DOCKER_DIR)/$(ENV_FILE)
+	if [ "$(env)" = "--prod" ]; then \
+		sudo docker-compose -f docker-compose.yml -f docker-compose-scc.prod.yml --env-file $(DOCKER_DIR)/.env.prod up -d --build; \
+	else \
+		# dev environment; \
+		sudo docker-compose up -d --build; \
+	fi
+	# sleep 1m
+	if [ "$(env)" = "--prod" ]; then \
+		# (sudo docker image save $$(sudo docker image ls | grep scc_db | awk '{print $$3}') -o $(BUILD_DIR)/scc_db.tar scc_db:v1); \
+		# (sudo docker image save $$(sudo docker image ls | grep scc_adminer | awk '{print $$3}') -o $(BUILD_DIR)/scc_adminer.tar scc_adminer:v1); \
+		# (sudo docker image save $$(sudo docker image ls | grep scc_app1 | awk '{print $$3}') -o $(BUILD_DIR)/scc_app1.tar scc_app1:v1); \
+		# (sudo docker image save $$(sudo docker image ls | grep scc_web | awk '{print $$3}') -o $(BUILD_DIR)/scc_web.tar scc_web:v1); \
+		# Bundle docker compose for deployment.; \
+		# cd $(BUILD_DIR); \sudo tar -czvf $(SCC_TAR) *.tar; \cd ..;\
+		sudo rm -rf $(OUT_DIR)/*; \
+		# mv $(BUILD_DIR)/*.tar.gz $(OUT_DIR)/; \
+		cp -r $(DOCKER_DIR)/deploy_scc_docker_registry.sh $(DOCKER_DIR)/$(ENV_FILE) $(DOCKER_DIR)/docker-compose.yml $(DOCKER_DIR)/.env.prod $(DOCKER_DIR)/ssl $(OUT_DIR)/; \
+		mkdir -p $(OUT_DIR)/scc-db; \cp -r scc-db/scc.sql $(OUT_DIR)/scc-db/scc.sql; \cp -r ../Risk\ Manager $(OUT_DIR)/; \cp -r ../SecurityOnion $(OUT_DIR)/; \cp -r ../TIP $(OUT_DIR)/; \cp -r ../SOAR $(OUT_DIR)/; \
+		echo "SCC deployment bundle generated successfully."; \
+		# cd $(BUILD_DIR); \sudo rm *.tar; \
+		# sudo rm -rf $(SCC_TMP_DIR); \
+	fi
+docker-push-image:
+	if [ "$(env)" = "--prod" ]; then \
+		docker tag scc_db:v1 $(ACDS_REGISTRY)/scc_db:$(ACDS_SCC_VERSION); \
+		docker push $(ACDS_REGISTRY)/scc_db:$(ACDS_SCC_VERSION); \
+		docker tag scc_adminer:v1 $(ACDS_REGISTRY)/scc_adminer:$(ACDS_SCC_VERSION); \
+		docker push $(ACDS_REGISTRY)/scc_adminer:$(ACDS_SCC_VERSION); \
+		docker tag scc_app1:v1 $(ACDS_REGISTRY)/scc_app1:$(ACDS_SCC_VERSION); \
+		docker push $(ACDS_REGISTRY)/scc_app1:$(ACDS_SCC_VERSION); \
+		docker tag scc_web:v1 $(ACDS_REGISTRY)/scc_web:$(ACDS_SCC_VERSION); \
+		docker push $(ACDS_REGISTRY)/scc_web:$(ACDS_SCC_VERSION); \
+	fi
+cleanall:
+	# stop all containers
+	( sudo docker container stop $$(sudo docker container ls | grep scc | awk '{print $$1}') ) && ( echo "Stopped Containers" ) 
+	# remove all containers
+	( sudo docker container rm $$(sudo docker container ls -a | grep scc | awk '{print $$1}') ) && ( echo "Removed Containers" ) 
+	# remove all images
+	( sudo docker rmi -f $$(sudo docker images | grep scc | awk '{print $$3}') ) && ( echo "Removed Images" ) 
+	# remove all volumes
+	( sudo docker volume rm $$(sudo docker volume ls | grep scc | awk '{print $$2}') ) && ( echo "Remove Volumes" ) 
+.PHONY: clean cleanall build all
+-----------------------------------------------------
+#!/bin/bash
+echo "Running Cleanup Script"
+# stop all containers
+container=$(docker container ls -aq)
+if [ -z "$container" ]; then
+    echo "No Containers Found"
+else
+    echo "Stopping Containers"
+    docker container stop $(docker container ls -aq)
+    echo "Removing Containers"
+    docker container rm $(docker container ls -aq)
+fi
+# Remove Images
+images=$(docker images -a -q)
+if [ -z "$images" ]; then
+    echo "No Images Found"
+else
+    echo "Removing Images"
+    docker rmi -f $(docker images -a -q)
+fi
+volumes=$(docker volume ls -q)
+if [ -z "$volumes" ]; then
+    echo "No Volumes Found"
+else
+    echo "Removing Volumes"
+    docker volume rm $(docker volume ls -q)
+fi
+----------------------------------------
+
+#!/bin/sh
+ROOTDIR=$PWD
+SCC_TMP_DIR=$PWD/tmp_scc
+script_name=$0
+env=$1
+server_ip=$2
+usage() {
+    echo ""
+    echo "Usage: sh $script_name [build_option [server_ip]]"
+    echo "--local:    Build docker for local deployment. SCC UI and other components will be served on localhost."
+    echo "--prod:     Build docker for prod deployment. SCC UI and other components will be served on [server_ip]."
+    echo ""
+}
+if [ "$env" != "--prod" ] && [ "$env" != "--local" ]; then
+    usage
+    exit 1
+fi
+if [ -d "$SCC_TMP_DIR" ]; then
+    sudo rm -rf $SCC_TMP_DIR 
+fi
+checkDirStructire() {
+    if [ -d "../scc-db" ] && [ -d "../scc-adminer" ] && [ -d "../scc-ui" ] && [ -d "../scc-java" ]
+    then
+        echo "Directory structure check complete."
+    else
+        echo "Please copy entire SCC folder and maintain directory structure. (some folder is missing.)"
+        exit
+    fi
+}
+removePrevBuild() {
+    echo $env
+    cd $ROOTDIR/..
+    if [ "$env" = "--prod" ]; then 
+        sudo docker-compose -f docker-compose.yml -f docker-compose-scc.prod.yml --env-file $ROOTDIR/../scc-ui/.env.prod down -v --rmi local --remove-orphans
+    else
+        sudo docker-compose down -v --rmi local --remove-orphans
+    fi
+    cd $ROOTDIR
+    # sleep 1m
+}
+getLatestCode() {
+    mkdir $SCC_TMP_DIR
+    cd $SCC_TMP_DIR
+    git clone ssh://code.acds.net.in:29418/SCC
+    git_clone_status=$?
+    if [ $git_clone_status -eq 0 ]; then
+        echo "Fetched latest code."
+        cd $ROOTDIR
+        cp -r $SCC_TMP_DIR/SCC/SCC/scc-ui/* ../scc-ui/
+        # cp -r $SCC_TMP_DIR/SCC/SCC/scc-java/* ../scc-java/
+    else
+        read -p "Couldn't fetch latest code. Do you want to continue with existing code? [y/n]" selected_option
+        case $selected_option in  
+            y|Y)
+                echo "Continuing with existing code..."
+                ;; 
+            n|N)
+                echo "Exiting..."
+                exit $git_clone_status
+                ;; 
+            *)
+                echo "Invalid option.."
+                exit $git_clone_status
+                ;; 
+        esac
+    fi
+}
+replaceEnv() {
+    cd $ROOTDIR
+    if [ "$env" = "--prod" ] && [ "$server_ip" != "" ]; then
+        echo `pwd`
+        sed -i "s/localhost/$server_ip/g" $ROOTDIR/../scc-ui/.env.prod
+    fi
+}
+buildAndRunContainers() {
+    echo "Building docker images and running containers... \n"
+    cd $ROOTDIR/..
+    if [ "$env" = "--prod" ]; then 
+        sudo docker-compose -f docker-compose.yml -f docker-compose-scc.prod.yml --env-file $ROOTDIR/../scc-ui/.env.prod up -d --build
+    else
+        sudo docker-compose up -d --build
+    fi
+    docker_compose_status=$?
+    if [ $docker_compose_status -eq 0 ]; then
+        echo "*************************************\n"
+        sleep 1m
+        echo "Containers are running. \n"
+    else
+        exit $docker_compose_status 
+    fi
+}
+saveImages() {
+    if [ "$env" = "--prod" ]; then 
+        cd $ROOTDIR
+        echo "Creating compressed file from latest image...\n"
+        sudo docker image save $(sudo docker image ls | grep scc_web | awk '{print $3}') -o scc_web.tar
+        sudo docker image save $(sudo docker image ls | grep scc_app1 | awk '{print $3}') -o scc_app1.tar 
+        sudo docker image save $(sudo docker image ls | grep scc_app2 | awk '{print $3}') -o scc_app2.tar 
+        sudo docker image save $(sudo docker image ls | grep scc_db | awk '{print $3}') -o scc_db.tar  
+        sudo docker image save $(sudo docker image ls | grep scc_adminer | awk '{print $3}') -o scc_adminer.tar  
+        file_name=$ROOTDIR/SCC_$(date "+%d_%B_%Y_%H%M%S").tar.gz
+        # Bundle docker compose for deployment.
+        sudo tar -czvf $file_name scc_web.tar scc_app1.tar scc_app2.tar scc_db.tar scc_adminer.tar scc-docker-compose-deploy.yml 
+        sudo rm scc_web.tar scc_app1.tar scc_app2.tar scc_db.tar scc_adminer.tar
+        echo "SCC deployment bundle " $file_name "generated successfully."
+        sudo rm -rf $SCC_TMP_DIR
+    fi 
+}
+############################################################################
+checkDirStructire
+removePrevBuild
+# getLatestCode
+replaceEnv
+buildAndRunContainers
+saveImages
+echo "***************Completed**************\n"
+
+----------------------------------------------------
+
+#!/bin/sh
+if [ $# -lt 1 ]; then 
+    echo "Usage : ./deploy_scc.sh <SCC Bundle>" $#
+    exit 
+fi
+SCCDIR=scc-deploy
+if [ -d "$SCCDIR" ]; then
+    echo "removing existing installation directory"
+    sudo rm -rf $SCCDIR 
+fi
+# stop all containers
+sudo docker container stop $(sudo docker container ls | grep scc | awk '{print $1}')
+# remove all containers
+sudo docker container rm $(sudo docker container ls -a | grep scc | awk '{print $1}')
+# remove all images
+sudo docker rmi -f $(sudo docker images | grep scc | awk '{print $3}')
+# remove all volumes
+sudo docker volume rm $(sudo docker volume ls | grep scc | awk '{print $2}')
+mkdir $SCCDIR
+sudo tar -xvzf $1 -C $SCCDIR
+sudo docker image load -i $SCCDIR/scc_web.tar
+sudo docker image load -i $SCCDIR/scc_app1.tar
+sudo docker image load -i $SCCDIR/scc_db.tar
+sudo docker image load -i $SCCDIR/scc_adminer.tar  
+# sed -i "s/REACT_APP_HOST/$3/g" .env.prod
+sudo docker-compose -f docker-compose.local.yml up -d
+echo "SCC instance now running"
+
+------------------------------------------
+#!/bin/sh
+if [ $# -lt 1 ]; then 
+    echo "Usage : ./deploy_scc_docker_registry.sh <environment file>" $#
+    exit 
+fi
+ENVFILE=$1
+# stop all containers
+sudo docker container stop $(sudo docker container ls | grep scc | awk '{print $1}')
+# remove all containers
+sudo docker container rm $(sudo docker container ls -a | grep scc | awk '{print $1}')
+# remove all images
+sudo docker rmi -f $(sudo docker images | grep scc | awk '{print $3}')
+# remove all volumes
+sudo docker volume rm $(sudo docker volume ls | grep scc | awk '{print $2}')
+echo "Deploying SCC"
+docker-compose --env-file $ENVFILE up --no-build  -d
+echo "SCC instance now running"
+-----------------------------------------------
+version: "3.1"
+services:
+  db:
+    container_name: scc-db
+    image: scc_db:v1
+    restart: always
+    networks:
+      - scc_backend
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=secret
+      - POSTGRES_DB=scc_db
+      - PGDATA=/var/lib/postgresql/data/pgdata
+#    ports:
+#      - 5432:5432
+#    env_file:
+#      - ./db/db.env
+    volumes:
+      - ./scc-db/scc.sql:/docker-entrypoint-initdb.d/init.sql
+      - sccdata:/var/lib/postgresql/data
+  adminer:
+    container_name: scc-adminer
+    image: scc_adminer:v1
+    restart: always
+    networks:
+      - scc_backend
+    ports:
+      - 8080:8080
+  app1:
+    container_name: scc-java
+    image: scc_app1:v1
+    restart: always
+    ports:
+      - "8443:8443"
+    networks: 
+      - scc_backend
+      - scc_frontend
+  web:
+    container_name: scc-ui
+    image: scc_web:v1
+    restart: always
+    env_file: 
+      - ./.env.prod
+    volumes:
+      - ./ssl:/etc/nginx/ssl/
+    ports:
+      - "443:443"
+    networks: 
+      - scc_frontend
+networks:
+  scc_backend:
+      driver: bridge
+  scc_frontend:
+      driver: bridge
+volumes:
+  sccdata:
+
+---------------------------------------------
+
+
+version: "3.1"
+services:
+  db:
+    container_name: scc-db
+    image: docker.acds.net.in/scc/scc_db:${ACDS_SCC_VERSION}
+    restart: always
+    networks:
+      - scc_backend
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=secret
+      - POSTGRES_DB=scc_db
+      - PGDATA=/var/lib/postgresql/data/pgdata
+#    ports:
+#      - 5432:5432
+#    env_file:
+#      - ./db/db.env
+    volumes:
+      - ./scc-db/scc.sql:/docker-entrypoint-initdb.d/init.sql
+      - sccdata:/var/lib/postgresql/data
+  adminer:
+    container_name: scc-adminer
+    image: docker.acds.net.in/scc/scc_adminer:${ACDS_SCC_VERSION}
+    restart: always
+    networks:
+      - scc_backend
+    ports:
+      - 8080:8080
+  app1:
+    container_name: scc-java
+    image: docker.acds.net.in/scc/scc_app1:${ACDS_SCC_VERSION}
+    restart: always
+    ports:
+      - "8443:8443"
+    networks: 
+      - scc_backend
+      - scc_frontend
+  web:
+    container_name: scc-ui
+    image: docker.acds.net.in/scc/scc_web:${ACDS_SCC_VERSION}
+    restart: always
+    env_file: 
+      - ./.env.prod
+    volumes:
+      - ./ssl:/etc/nginx/ssl/
+    ports:
+      - "443:443"
+    networks: 
+      - scc_frontend
+networks:
+  scc_backend:
+      driver: bridge
+  scc_frontend:
+      driver: bridge
+volumes:
+  sccdata:
+------------------------------------------
+Kibana is your window into the Elastic Stack. Specifically, it's a browser-based analytics and search dashboard for Elasticsearch.
+
+Getting Started
+Using a Kibana Release
+Building and Running Kibana, and/or Contributing Code
+Documentation
+Version Compatibility with Elasticsearch
+Questions? Problems? Suggestions?
+Getting Started
+If you just want to try Kibana out, check out the Elastic Stack Getting Started Page to give it a whirl.
+
+If you're interested in diving a bit deeper and getting a taste of Kibana's capabilities, head over to the Kibana Getting Started Page.
+
+Using a Kibana Release
+If you want to use a Kibana release in production, give it a test run, or just play around:
+
+Download the latest version on the Kibana Download Page.
+Learn more about Kibana's features and capabilities on the Kibana Product Page.
+We also offer a hosted version of Kibana on our Cloud Service.
+Building and Running Kibana, and/or Contributing Code
+You might want to build Kibana locally to contribute some code, test out the latest features, or try out an open PR:
+
+CONTRIBUTING.md will help you get Kibana up and running.
+If you would like to contribute code, please follow our STYLEGUIDE.mdx.
+For all other questions, check out the FAQ.md and wiki.
+Documentation
+Visit Elastic.co for the full Kibana documentation.
+
+For information about building the documentation, see the README in elastic/docs.
+
+Version Compatibility with Elasticsearch
+Ideally, you should be running Elasticsearch and Kibana with matching version numbers. If your Elasticsearch has an older version number or a newer major number than Kibana, then Kibana will fail to run. If Elasticsearch has a newer minor or patch number than Kibana, then the Kibana Server will log a warning.
+
+Note: The version numbers below are only examples, meant to illustrate the relationships between different types of version numbers.
+
+Situation	Example Kibana version	Example ES version	Outcome
+Versions are the same.	7.15.1	7.15.1	💚 OK
+ES patch number is newer.	7.15.0	7.15.1	⚠️ Logged warning
+ES minor number is newer.	7.14.2	7.15.0	⚠️ Logged warning
+ES major number is newer.	7.15.1	8.0.0	🚫 Fatal error
+ES patch number is older.	7.15.1	7.15.0	⚠️ Logged warning
+ES minor number is older.	7.15.1	7.14.2	🚫 Fatal error
+ES major number is older.	8.0.0	7.15.1	🚫 Fatal error
+Questions? Problems? Suggestions?
+If you've found a bug or want to request a feature, please create a GitHub Issue. Please check to make sure someone else hasn't already created an issue for the same topic.
+Need help using Kibana? Ask away on our Kibana Discuss Forum and a fellow community member or Elastic engineer will be glad to help you out.
+
+--------------------------------------------------------------
+
+#!/bin/bash
+# Assumptions-
+#  Slave and Master Directory with their compose files are present
+#  docker is already installed
+function docker_clean() {
+    sudo docker-compose -f $2 stop  $1
+    sudo docker-compose -f $2 rm  $1
+}
+while true;
+do
+echo  "Select the options number from below list :
+ 1. Seed.
+ 2. Slaves.
+ 3. DataMart.
+ 4. Database.
+ 5. Itop
+ 6. ADService
+ 7. Kafka
+ 8. Docker & Docker-compose
+ 0. Exit"
+read -p "Enter the number to be install: " x
+case $x in
+"1") echo "Seed is Installing ....."
+#Removing any previous jars, docker images and containers
+sudo rm -rf ./Master/master.jar
+sudo docker image rm -f sdl/master:latest
+docker_clean "seed" "./Master/seed.yml"
+#Creating docker images using jars
+sudo cp -rf master-1.0-allinone.jar Master/master.jar
+sudo docker build --no-cache -t sdl/master ./Master/
+sudo docker-compose -f ./Master/seed.yml up -d --remove-orphans
+;;
+"2") echo "Slaves is Installing ....."
+#Removing any previous jars, docker images and containers
+sudo rm -rf ./Slave/slave.jar
+sudo docker image rm -f sdl/slave:latest
+docker_clean "slave_1 slave_2" "./Slave/slave.yml"
+#Creating docker images using jars
+sudo cp -rf slave-1.0-allinone.jar Slave/slave.jar
+sudo docker build --no-cache -t sdl/slave ./Slave/
+sudo docker-compose  -f ./Slave/slave.yml up -d --remove-orphans
+;;
+"3") echo "DataMart is Installing ....."
+#Removing any previous jars, docker images and containers
+sudo rm -rf ./DM/Datamart/server/datamart-server-*
+sudo docker image rm -f datamart/datamart-server:latest
+docker_clean "datamart-server" "./DM/Datamart/server/datamart.yml"
+#Creating docker images using jars
+sudo cp -rf datamart-server-1.0.jar ./DM/Datamart/server/datamart-server.jar
+sudo docker build --no-cache -t datamart/datamart-server ./DM/Datamart/server/
+sudo docker-compose -f ./DM/Datamart/server/datamart.yml up -d --remove-orphans
+;;
+"4") echo "Database is Installing ....."
+#Removing any previous jars, docker images and containers
+docker_clean "db" "./Database/database.yml"
+#Creating docker images using jars
+#sudo docker load --input ./Database/timescaledb.tar
+sudo docker-compose  -f ./Database/database.yml up -d --remove-orphans
+#To make tar or backup for container
+#sudo docker save timescale/timescaledb:latest-pg12 > timescaledb.tar
+;;
+"5") echo "Installing Itop : "
+docker_clean "sdl-itop" "./itop/docker-itop.yml"
+sudo docker-compose -f ./itop/docker-itop.yml up -d
+;;
+"6") echo "Installing AD : "
+docker_clean "openldap" "./openldap/docker-openldap.yml"
+docker_clean "ldap-admin" "./openldap/docker-openldap.yml"
+sudo docker-compose -f ./openldap/docker-openldap.yml up -d
+;;
+"7") echo "Installing Kafka : "
+docker_clean "zookeeper" "components.yml"
+docker_clean "kafka" "components.yml"
+ip=`ip -4 route get 8.8.8.8 | awk {'print $7'} | tr -d '\n'`
+echo "IP of host: $ip"
+line="      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT:\/\/"${ip}":9092"
+`sed -i "24s/.*/$line/" components.yml`
+sudo docker-compose -f components.yml up -d zookeeper
+sudo docker-compose -f components.yml up -d kafka
+;;
+"8") echo "Installing docker : "
+echo "Running sudo apt update"
+sudo apt update -y -qq
+sudo apt -y -qq install apt-transport-https ca-certificates curl software-properties-common
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+sudo add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu focal stable"
+apt-cache policy docker-ce
+sudo apt install docker-ce -y
+sudo docker --version
+echo "\n Installing docker-compose : "
+sudo curl -L "https://github.com/docker/compose/releases/download/1.27.4/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+sudo chmod +x /usr/local/bin/docker-compose
+sudo docker-compose --version
+;;
+0)
+echo "Exiting..."
+exit 1
+;;
+esac
+echo "Installion done"
+done
+
+--------------------------------------------------
+#!/bin/bash
+# Assumptions-
+#  Slave and Master Directory with their compose files are present
+#  docker is already installed
+stop(){
+   echo "Removing SDL containers/images $1"
+   ENVFILE=$1
+   # stop all containers
+   docker container stop $(docker container ls | grep $1 | awk '{print $1}')
+   # remove all containers
+   docker container rm $(docker container ls -a | grep $1 | awk '{print $1}')
+    # remove all images
+    docker rmi -f $(docker images | grep $1 | awk '{print $3}')
+    # remove all volumes
+    docker volume rm $(docker volume ls | grep $1 | awk '{print $2}')
+}
+stop $1
+-----------------------------------------
+#!/bin/bash
+# Assumptions-
+#  Slave and Master Directory with their compose files are present
+#  docker is already installed
+start(){
+  ENVFILE=$1
+  echo " starting SDL containers/images $2"
+  docker-compose --env-file $ENVFILE  up --no-build -d $2
+}
+start $1 $2
+----------------------
+
+# the second stage of our build will use open jdk 8 on alpine 3.9
+FROM openjdk:11.0.6
+# copy only the artifacts we need from the first stage and discard the rest
+COPY  ./master.jar /master.jar
+# set the startup command to execute the jar
+CMD ["java", "-jar", "/master.jar"]
+
+-------------------------------------
+
+FROM maven:3.8.4-openjdk-11 as build
+WORKDIR /app
+COPY . .
+RUN mvn clean package
+FROM openjdk:11
+#ARG JAR_FILE=target/*.jar
+COPY --from=build /app/target/scc-java.jar app.jar
+ENTRYPOINT ["java","-jar","/app.jar"]
+
+----------------------------------------------------
+
+FROM maven:3.8.4-openjdk-11 as build
+WORKDIR /app
+COPY . .
+RUN mvn clean install
+CMD mvn spring-boot:run
+------------------------------------------
+#Dockerfile to build db. 
+FROM postgres:13.4 as scc-db
+
+---------------------------------------------
+# the second stage of our build will use open jdk 8 on alpine 3.9
+FROM openjdk:11.0.6
+# copy only the artifacts we need from the first stage and discard the rest
+COPY  ./slave.jar /slave.jar
+ 
+# set the startup command to execute the jar
+CMD ["java", "-jar", "/slave.jar"]
+
+------------------------------------------
+
+# the second stage of our build will use open jdk 8 on alpine 3.9
+FROM openjdk:11.0.6
+# copy only the artifacts we need from the first stage and discard the rest
+COPY  ./datamart-server.jar /datamart-server.jar
+COPY  ./DM/Datamart/server/cert/v-rent-0002.cer /v-rent-0002.cer
+RUN /usr/local/openjdk-11/bin/keytool -cacerts -storepass changeit -noprompt -trustcacerts -importcert -alias "v-rent-0002" -file /v-rent-0002.cer
+# set the startup command to execute the jar
+CMD ["java", "-jar", "/datamart-server.jar"]
+
+-----------------------------------------------------
+HOSTNAME=soar
+HOSTIP=127.0.0.1
+THEHIVE_SERVER_NAME=thehive.acds.net.in
+CORTEX_SERVER_NAME=cortex.acds.net.in
+HIVE_VERSION=4.1.18-1
+CORTEX_VERSION=3.1.3-1
+ELASTICSEARCH_VERSION=7.11.1
+NGINX_VERSION=1.19.5
+CASSANDRA_VERSION=3.11
+N8N_VERSION=0.175.1
+QRADAR_CONNECTOR_VERSION=1.0
+SDL_CONNECTOR_VERSION=1.0
+BACKEND_VERSION=0.9.52
+FRONTEND_VERSION=0.9.52
+ORBORUS_VERSION=0.9.56
+PLUGINS_DIR=plugins
+BUILD_DIR=build
+DOCKER_DIR=docker/docker-thehive
+TMP_DOCKER_DIR=docker-thehive
+OUT_DIR=release
+ifneq ($(BUILD_NUMBER),)
+ACDS_VERSION=_$(BUILD_NUMBER)
+else
+ACDS_VERSION=
+endif
+ACDS_PFSENSE_VERSION=1.0$(ACDS_VERSION)
+ACDS_MAILER_VERSION=1.0$(ACDS_VERSION)
+ACDS_ITOP_VERSION=1.0$(ACDS_VERSION)
+ACDS_IP2LOC_VERSION=1.0$(ACDS_VERSION)
+ACDS_WAZUH_VERSION=1.0$(ACDS_VERSION)
+ACDS_WAZUH_4_VERSION=1.0$(ACDS_VERSION)
+HIVE_TAR=thehive_$(HIVE_VERSION)$(ACDS_VERSION).tar.gz
+DOCKERHUB_REGISTRY=docker.acds.net.in/dockerhubproxy
+ACDS_REGISTRY=docker.acds.net.in/soar
+all: clean build
+build: build_analyzers build_n8n build_thehive
+setup:
+	echo "Installing tools for buiilding thehive scala code"
+	./setup.sh
+build_analyzers:
+	echo "Starting custom analyzer, responders build #$(BUILD_NUMBER)"
+	mkdir -p $(BUILD_DIR); mkdir -p $(OUT_DIR);
+	cd $(PLUGINS_DIR); ./build.sh $(ACDS_REGISTRY) $(ACDS_VERSION)
+	cd $(PLUGINS_DIR);  tar -czvf plugins.tar.gz *.tar
+	mv $(PLUGINS_DIR)/*.tar.gz $(OUT_DIR)/
+	mv $(PLUGINS_DIR)/analyzers/analyzers.json $(DOCKER_DIR)/vol/cortex
+	mv $(PLUGINS_DIR)/responders/responders.json $(DOCKER_DIR)/vol/cortex
+	echo "Custom Analyzers, Responders generated successfully."
+	
+build_n8n:
+	echo "Starting n8n build #$(BUILD)"
+	cd development/n8n; docker build -t $(DOCKERHUB_REGISTRY)/n8nio/n8n:${N8N_VERSION} -f Dockerfile .
+build_thehive:
+	echo "Starting thehive build #${BUILD}"
+	mkdir -p $(BUILD_DIR); mkdir -p $(OUT_DIR);
+	npm config set strict-ssl false
+	cd development/thehive/frontend; npm install; npm install --global bower; bower install; grunt build
+	cd development/thehive; ./sbt docker:stage
+	cd development/thehive/target/docker/stage; docker build . -t $(DOCKERHUB_REGISTRY)/thehiveproject/thehive4:${HIVE_VERSION}
+	cp -r applications/qradarconnector $(DOCKER_DIR)/qradarconnectordocker/
+	cp -r applications/sdlconnector $(DOCKER_DIR)/sdlconnectordocker/
+	cp -r applications/python_scripts $(DOCKER_DIR)/vol/
+	
+	sed -i '/HIVE_VERSION/c\' $(DOCKER_DIR)/.env
+	echo HIVE_VERSION=$(HIVE_VERSION) >> $(DOCKER_DIR)/.env
+	sed -i '/CORTEX_VERSION/c\' $(DOCKER_DIR)/.env
+	echo CORTEX_VERSION=$(CORTEX_VERSION) >> $(DOCKER_DIR)/.env
+	sed -i '/ELASTICSEARCH_VERSION/c\' $(DOCKER_DIR)/.env
+	echo ELASTICSEARCH_VERSION=$(ELASTICSEARCH_VERSION) >> $(DOCKER_DIR)/.env
+	sed -i '/CASSANDRA_VERSION/c\' $(DOCKER_DIR)/.env
+	echo CASSANDRA_VERSION=$(CASSANDRA_VERSION) >> $(DOCKER_DIR)/.env
+	sed -i '/NGINX_VERSION/c\' $(DOCKER_DIR)/.env
+	echo NGINX_VERSION=$(NGINX_VERSION) >> $(DOCKER_DIR)/.env
+	sed -i '/N8N_VERSION/c\' $(DOCKER_DIR)/.env
+	echo N8N_VERSION=$(N8N_VERSION) >> $(DOCKER_DIR)/.env
+	sed -i '/REGISTRY/c\' $(DOCKER_DIR)/.env
+	echo "REGISTRY=$(DOCKERHUB_REGISTRY)" >> $(DOCKER_DIR)/.env
+	sed -i '/QRADAR_CONNECTOR_VERSION/c\' $(DOCKER_DIR)/.env
+	echo QRADAR_CONNECTOR_VERSION=$(QRADAR_CONNECTOR_VERSION) >> $(DOCKER_DIR)/.env
+	sed -i '/SDL_CONNECTOR_VERSION/c\' $(DOCKER_DIR)/.env
+	echo SDL_CONNECTOR_VERSION=$(SDL_CONNECTOR_VERSION) >> $(DOCKER_DIR)/.env
+	sed -i '/HOSTNAME/c\' $(DOCKER_DIR)/.env
+	echo HOSTNAME=$(HOSTNAME) >> $(DOCKER_DIR)/.env
+	sed -i '/HOSTIP/c\' $(DOCKER_DIR)/.env
+	echo HOSTIP=$(HOSTIP) >> $(DOCKER_DIR)/.env
+	
+	cp -a $(DOCKER_DIR) $(TMP_DOCKER_DIR); 
+	cd $(TMP_DOCKER_DIR); sed -i '/server_name/c\server_name $(THEHIVE_SERVER_NAME)' vol/nginx/thehive.conf
+	cd $(TMP_DOCKER_DIR); sed -i '/server_name/c\server_name $(CORTEX_SERVER_NAME)' vol/nginx/cortex.conf
+	cd $(TMP_DOCKER_DIR); sed -i '/server_name/c\server_name $(N8N_SERVER_NAME)' vol/nginx/n8n.conf
+	cd $(TMP_DOCKER_DIR);  docker-compose up -d
+	docker commit $$( docker ps | grep thehive4 | awk '{print $$1}') $(ACDS_REGISTRY)/thehiveproject/thehive4:$(HIVE_VERSION)$(ACDS_VERSION)
+	docker commit $$( docker ps | grep 'cortex$$' | awk '{print $$1}') $(ACDS_REGISTRY)/thehiveproject/cortex:$(CORTEX_VERSION)$(ACDS_VERSION)
+	docker tag $(DOCKERHUB_REGISTRY)/library/elasticsearch:$(ELASTICSEARCH_VERSION) $(ACDS_REGISTRY)/library/elasticsearch:$(ELASTICSEARCH_VERSION)
+	docker tag $(DOCKERHUB_REGISTRY)/library/nginx:$(NGINX_VERSION) $(ACDS_REGISTRY)/library/nginx:$(NGINX_VERSION)
+	docker tag $(DOCKERHUB_REGISTRY)/library/cassandra:$(CASSANDRA_VERSION) $(ACDS_REGISTRY)/library/cassandra:$(CASSANDRA_VERSION)
+	docker tag $(DOCKERHUB_REGISTRY)/n8nio/n8n:$(N8N_VERSION) $(ACDS_REGISTRY)/n8nio/n8n:$(N8N_VERSION)
+	docker tag $(DOCKERHUB_REGISTRY)/qradar-connector:$(QRADAR_CONNECTOR_VERSION) $(ACDS_REGISTRY)/qradar-connector:$(QRADAR_CONNECTOR_VERSION)$(ACDS_VERSION)
+	docker tag $(DOCKERHUB_REGISTRY)/sdl-connector:$(SDL_CONNECTOR_VERSION) $(ACDS_REGISTRY)/sdl-connector:$(SDL_CONNECTOR_VERSION)$(ACDS_VERSION)	
+	
+	docker image save -o $(BUILD_DIR)/thehive_$(HIVE_VERSION)$(ACDS_VERSION).tar $(ACDS_REGISTRY)/thehiveproject/thehive4:$(HIVE_VERSION)$(ACDS_VERSION)
+	docker image save -o $(BUILD_DIR)/cortex_$(CORTEX_VERSION)$(ACDS_VERSION).tar $(ACDS_REGISTRY)/thehiveproject/cortex:$(CORTEX_VERSION)$(ACDS_VERSION)
+	docker image save -o $(BUILD_DIR)/elasticsearch.tar $(ACDS_REGISTRY)/library/elasticsearch:$(ELASTICSEARCH_VERSION)
+	docker image save -o $(BUILD_DIR)/nginx.tar $(ACDS_REGISTRY)/library/nginx:$(NGINX_VERSION) 
+	docker image save -o $(BUILD_DIR)/cassandra.tar $(ACDS_REGISTRY)/library/cassandra:$(CASSANDRA_VERSION) 
+	docker image save -o $(BUILD_DIR)/n8n.tar $(ACDS_REGISTRY)/n8nio/n8n:$(N8N_VERSION)
+	docker image save -o $(BUILD_DIR)/qradar-connector_$(QRADAR_CONNECTOR_VERSION)$(ACDS_VERSION).tar $(ACDS_REGISTRY)/qradar-connector:$(QRADAR_CONNECTOR_VERSION)$(ACDS_VERSION)
+	docker image save -o $(BUILD_DIR)/sdl-connector_$(SDL_CONNECTOR_VERSION)$(ACDS_VERSION).tar $(ACDS_REGISTRY)/sdl-connector:$(SDL_CONNECTOR_VERSION)$(ACDS_VERSION)
+	
+	cd $(BUILD_DIR);  tar -czvf $(HIVE_TAR) *.tar
+	mv $(BUILD_DIR)/*.tar.gz $(OUT_DIR)/
+	cp -r $(DOCKER_DIR) $(OUT_DIR)/
+	chmod 666 $(OUT_DIR)/docker-thehive/soar_config.ini
+	sed -i '/HIVE_VERSION/c\' $(OUT_DIR)/docker-thehive/.env
+	echo HIVE_VERSION=$(HIVE_VERSION)$(ACDS_VERSION) >> $(OUT_DIR)/docker-thehive/.env
+	sed -i '/CORTEX_VERSION/c\' $(OUT_DIR)/docker-thehive/.env
+	echo CORTEX_VERSION=$(CORTEX_VERSION)$(ACDS_VERSION) >> $(OUT_DIR)/docker-thehive/.env
+	sed -i '/QRADAR_CONNECTOR_VERSION/c\' $(OUT_DIR)/docker-thehive/.env
+	echo QRADAR_CONNECTOR_VERSION=$(QRADAR_CONNECTOR_VERSION)$(ACDS_VERSION) >> $(OUT_DIR)/docker-thehive/.env
+	sed -i '/SDL_CONNECTOR_VERSION/c\' $(OUT_DIR)/docker-thehive/.env
+	echo SDL_CONNECTOR_VERSION=$(SDL_CONNECTOR_VERSION)$(ACDS_VERSION) >> $(OUT_DIR)/docker-thehive/.env
+	sed -i '/HOSTNAME/c\' $(OUT_DIR)/docker-thehive/.env
+	echo HOSTNAME=$(HOSTNAME) >> $(OUT_DIR)/docker-thehive/.env
+	sed -i '/HOSTIP/c\' $(OUT_DIR)/docker-thehive/.env
+	echo HOSTIP=$(HOSTIP) >> $(OUT_DIR)/docker-thehive/.env
+	sed -i '/REGISTRY/c\' $(OUT_DIR)/docker-thehive/.env
+	echo "REGISTRY=$(ACDS_REGISTRY)" >> $(OUT_DIR)/docker-thehive/.env
+	cp docker/deploy_soar.sh $(OUT_DIR)/
+	cp -r playbooks $(OUT_DIR)/
+	cp -r applications $(OUT_DIR)/
+	echo "TheHive deployment bundle " $(OUT_DIR)/$(HIVE_TAR) "generated successfully."
+clean:
+	rm -rf $(BUILD_DIR);
+	[ -e $(TMP_DOCKER_DIR)/docker-compose.yml ] && ( cd $(TMP_DOCKER_DIR); docker-compose down -v --rmi all --remove-orphans; echo SUCCESS ) || echo "No docker-compose.yml to clean"
+	# Remove thehive target folders
+	cd development/thehive; ./sbt clean
+	# Remove temp docker folder
+	sudo rm -rf $(TMP_DOCKER_DIR)
+	sudo rm -rf $(DOCKER_DIR)/qradarconnectordocker/qradarconnector
+	sudo rm -rf $(DOCKER_DIR)/sdlconnectordocker/sdlconnector
+	sudo rm -rf $(DOCKER_DIR)/vol/python_scripts
+	
+	#Remove docker images of analyzers and responders
+	sudo rm -rf $(PLUGINS_DIR)/*.tar
+	docker rmi -f  $$( docker image ls | grep acds-mailer | awk '{print $$3}' ) || true
+	docker container stop $$( docker container ls | grep registry | awk '{print $$1}') || true
+	docker rmi -f  $$( docker image ls | grep registry | awk '{print $$3}' ) || true
+cleanall:
+	# stop all containers
+	( docker container stop $$(docker container ls -aq) ) && ( echo "Stopped Containers" ) 
+	# remove all containers
+	( docker container rm $$(docker container ls -aq) ) && ( echo "Removed Containers" ) 
+	# remove all images
+	( docker rmi -f $$(docker images -a -q) ) && ( echo "Removed Images" ) 
+	# remove all volumes
+	( docker volume rm $$(docker volume ls -q) ) && ( echo "Remove Volumes" ) 
+release:
+	# Push the images to docker registry
+	echo "Pushing docker images to registry...."
+	docker push $(ACDS_REGISTRY)/library/elasticsearch:$(ELASTICSEARCH_VERSION)
+	docker push $(ACDS_REGISTRY)/library/nginx:$(NGINX_VERSION)
+	docker push $(ACDS_REGISTRY)/library/cassandra:$(CASSANDRA_VERSION)
+	docker push $(ACDS_REGISTRY)/thehiveproject/thehive4:$(HIVE_VERSION)$(ACDS_VERSION)
+	docker push $(ACDS_REGISTRY)/thehiveproject/cortex:$(CORTEX_VERSION)$(ACDS_VERSION)
+	docker push $(ACDS_REGISTRY)/acds-pfsense:$(ACDS_PFSENSE_VERSION)
+	docker push $(ACDS_REGISTRY)/acds-mailer:$(ACDS_MAILER_VERSION)
+	docker push $(ACDS_REGISTRY)/acds-itop:$(ACDS_ITOP_VERSION)
+	docker push $(ACDS_REGISTRY)/acds-wazuh:$(ACDS_WAZUH_VERSION)
+	docker push $(ACDS_REGISTRY)/acds-wazuh-4:$(ACDS_WAZUH_4_VERSION)
+	docker push $(ACDS_REGISTRY)/acds-ip2location:$(ACDS_IP2LOC_VERSION)
+	docker push $(ACDS_REGISTRY)/n8nio/n8n:$(N8N_VERSION)
+	docker push $(ACDS_REGISTRY)/qradar-connector:$(QRADAR_CONNECTOR_VERSION)$(ACDS_VERSION)
+	docker push $(ACDS_REGISTRY)/sdl-connector:$(SDL_CONNECTOR_VERSION)$(ACDS_VERSION)
+	
+	echo "Images successfully pushed to registry."
+.PHONY: clean build build_analyzers build_thehive release all
+
+----------------------------------------------------------
+if [ $# -lt 1 ]; then 
+    echo "Usage : ./build_soar.sh <REMOVE_EXISTING_DOCKER_IMAGES_VOLUMES_CONTAINERS>"
+    echo "Usage : ./build_soar.sh true"
+    exit 
+fi
+CLEAN_SETUP=$1
+ROOTDIR=$PWD 
+THEHIVEDIR=$PWD/tmp_thehive
+HIVE_VERSION=thehive4:latest #To change versiion : Replace latest with 4.1.9-1
+CORTEX_VERSION=cortex:latest #To change versiion : Replace latest with 3.1.1-1
+if [ -d "$THEHIVEDIR" ]; then
+	echo "Removing existing files..."
+    sudo rm -rf $THEHIVEDIR 
+fi
+if [ "$CLEAN_SETUP" = true ] ; then
+	echo 'Removing old installation/volumes if any ....'
+	# stop all containers
+	sudo docker container stop $(sudo docker container ls -aq)
+	# remove all containers
+	sudo docker container rm $(sudo docker ps -a -q)
+	# remove all images
+	sudo docker rmi -f $(sudo docker images -a -q)
+	# remove all volumes
+	sudo docker system prune -af --volumes
+	echo 'Removing completed...'
+fi
+mkdir tmp_thehive
+cd tmp_thehive
+git clone https://github.com/TheHive-Project/Docker-Templates.git
+cd Docker-Templates/docker/thehive4-cortex31-nginx-https
+sudo mkdir vol_bk
+sudo cp -r vol/* vol_bk/
+sed -i -e 's/thehive4:latest/'$HIVE_VERSION'/' docker-compose.yml
+sed -i -e 's/cortex:latest/'$CORTEX_VERSION'/' docker-compose.yml
+sed -i -e 's/external: true//' docker-compose.yml
+echo "docker-compose running.."
+sudo docker-compose up -d
+sleep 1m
+sudo docker image save $(sudo docker image ls | grep thehive4 | awk '{print $3}') -o thehive4.tar
+sudo docker image save $(sudo docker image ls | grep cortex | awk '{print $3}') -o cortex.tar
+sudo docker image save $(sudo docker image ls | grep elasticsearch | awk '{print $3}') -o elasticsearch.tar 
+sudo docker image save $(sudo docker image ls | grep nginx | awk '{print $3}') -o nginx.tar  
+sudo docker image save $(sudo docker image ls | grep cassandra | awk '{print $3}') -o cassandra.tar  
+file_name=$ROOTDIR/SOAR_$(date "+%d_%B_%Y_%H%M%S").tar.gz
+echo $file_name
+sudo tar -czvf $file_name thehive4.tar cortex.tar elasticsearch.tar nginx.tar cassandra.tar docker-compose.yml .env vol_bk
+echo "SOAR deployment bundle " $file_name "generated successfully."
+sudo docker-compose stop
+sudo rm -rf $THEHIVEDIR
+
+-------------------------------------------------
+ARG1=$1
+if [[ $# -eq 1 && $ARG1 == cleanall ]]; then
+	echo "Cleaning all....."
+	# stop all containers
+	 docker container stop $( docker container ls -aq)
+	# remove all containers
+	 docker container rm $( docker ps -a -q)
+	# remove all images
+	 docker rmi -f $( docker images -a -q)
+	# remove all volumes
+	 docker volume rm $( docker volume ls -q)
+elif [ $# -eq 4 ]; then
+	ROOTDIR=$PWD
+	INSTALLDIR=$ROOTDIR/docker-thehive
+	echo "Installing TheHive ..."
+	tar -xvzf $1 -C $INSTALLDIR
+	tar -xvzf $2 -C $INSTALLDIR
+	cd $INSTALLDIR
+	# stop all containers
+	echo "Stopping TheHive containers..."
+	 docker container stop thehive cortex cortex2 nginx cassandra elasticsearch registry n8n qradar-connector sdl-connector
+	# remove all containers
+	echo "Removing TheHive containers..."
+	 docker container rm thehive cortex cortex2 nginx cassandra elasticsearch registry n8n qradar-connector sdl-connector
+	# remove all images
+	 docker rmi -f $( docker images -a | grep thehiveproject/cortex)
+	 docker rmi -f $( docker images -a | grep thehiveproject/thehive4)
+	 docker rmi -f $( docker images -a | grep cassandra)
+	 docker rmi -f $( docker images -a | grep elasticsearch)
+	 docker rmi -f $( docker images -a | grep nginx)
+	 docker rmi -f $( docker images -a | grep acds-mailer)
+	 docker rmi -f $( docker images -a | grep acds-itop)
+	 docker rmi -f $( docker images -a | grep acds-pfsense)
+	 docker rmi -f $( docker images -a | grep acds-ip2location)
+	 docker rmi -f $( docker images -a | grep acds-wazuh)
+	 docker rmi -f $( docker images -a | grep acds-wazuh-4)
+	 docker rmi -f $( docker images -a | grep registry)
+	 docker rmi -f $( docker images -a | grep n8n)
+	 docker rmi -f $( docker images -a | grep qradar-connector)
+	 docker rmi -f $( docker images -a | grep sdl-connector)
+	 
+	# remove all volumes
+	 docker volume rm $( docker volume ls -q) 
+	# docker system prune -af --volumes
+	docker image load -i thehive*.tar
+	docker image load -i cortex*.tar
+	docker image load -i elasticsearch.tar
+	docker image load -i nginx.tar
+	docker image load -i cassandra.tar
+	docker image load -i acds-mailer.tar
+	docker image load -i acds-itop.tar
+	docker image load -i acds-pfsense.tar
+	docker image load -i acds-wazuh.tar
+	docker image load -i acds-wazuh-4.tar
+	docker image load -i acds-ip2location.tar
+	docker image load -i n8n.tar
+	docker image load -i qradar-connector*.tar
+        docker image load -i sdl-connector*.tar
+	cd $INSTALLDIR
+	sed -i '/HOSTNAME/c\' .env
+	echo HOSTNAME=$3 >> .env
+	sed -i '/HOSTIP/c\' .env
+	echo HOSTIP=$4 >> .env
+	docker-compose up -d
+	sleep 3m
+	echo "Setting up database permissions..."
+	# To fix elasticsearch/cassandra permission issue
+	sudo chown -R 1000:1000 vol
+	docker-compose stop
+	docker-compose up -d
+	sleep 1m
+	echo "=============================================================================================="
+	echo "SOAR instance is now running.."
+	echo "Make sure you copy Cortex authentication keys to application.conf file of thehive."
+	echo "And restart thehive container with command:  docker-compose restart thehive"
+	echo "=============================================================================================="
+else
+  echo "Usage : ./deploy_soar.sh <Thehive Bundle> <Plugin Bundle> <Server Host> <Server IP>"
+  echo "Usage for cleanall: ./deploy_soar.sh cleanall"
+fi
+------------------------------------------
+#!/bin/sh -x
+echo "Installating linux packages, jdk, nodejs and npm.(https://linuxize.com/post/how-to-install-node-js-on-ubuntu-18.04/)"
+curl -sL https://deb.nodesource.com/setup_12.x | sudo -E bash –
+apt-get update; apt-get install -y apt-transport-https nodejs npm openjdk-8-jre-headless openjdk-8-jdk-headless scala
+node --version
+npm --version
+npm config set strict-ssl false
+echo Install grunt and bower
+npm install -g grunt@1.1.0 --save-dev
+npm install -g bower
+--------------------------------------------
+FROM python:3
+WORKDIR /qradarconnector/
+COPY qradarconnector /qradarconnector/
+RUN apt-get update; apt-get install -y --no-install-recommends \
+	python3-pip \
+        # Requirements:
+        supervisor \
+        git \
+        cron \
+        && apt-get autoremove -y && apt-get clean -y && rm -rf /var/lib/apt/lists/*
+RUN pip3 install python-magic==0.4.15 requests==2.21.0 future==0.17.1 
+COPY files/entrypoint_qradar.sh /
+COPY files/entrypoint.sh /
+COPY files/etc/supervisor/supervisor.conf /etc/supervisor/conf.d/supervisord.conf
+ENTRYPOINT [ "/entrypoint.sh" ]
+----------------------------------------------
+FROM python:3
+WORKDIR /sdlconnector/
+COPY sdlconnector /sdlconnector/
+RUN apt-get update; apt-get install -y --no-install-recommends \
+	python3-pip \
+        # Requirements:
+        supervisor \
+        git \
+        #cron \
+        && apt-get autoremove -y && apt-get clean -y && rm -rf /var/lib/apt/lists/*
+RUN pip3 install requests==2.21.0 watchdog
+COPY files/entrypoint_sdlconnector.sh /
+COPY files/entrypoint.sh /
+COPY files/etc/supervisor/supervisor.conf /etc/supervisor/conf.d/supervisord.conf
+ENTRYPOINT [ "/entrypoint.sh" ]
+-----------------------------------------------
+nginx
+
+#ssl_certificate /etc/ssl/nginx-selfsigned.crt;
+#ssl_certificate_key /etc/ssl/nginx-selfsigned.key;
+ssl_certificate /etc/ssl/cert.pem;
+ssl_certificate_key /etc/ssl/key.pem;
+
+-----------------------------------------
+server {
+  listen 443 ssl;
+  server_name cortex.acds.net.in;
+  #access_log /var/log/nginx/cortex.access.log main;
+  #error_log /var/log/nginx/cortex.error.log;
+  proxy_connect_timeout   600;
+  proxy_send_timeout      600;
+  proxy_read_timeout      600;
+  send_timeout            600;
+  client_max_body_size    2G;
+  proxy_buffering off;
+  client_header_buffer_size 8k;
+  location / {
+    add_header              Strict-Transport-Security "max-age=31536000";
+    proxy_pass            http://cortex-in:9001;
+    proxy_http_version      1.1;
+  }
+}
+-------------------------------
+
+server {
+  listen 443 ssl;
+  server_name workflow.acds.net.in;
+  #access_log /var/log/nginx/n8n.access.log main;
+  #error_log /var/log/nginx/n8n.error.log;
+  proxy_connect_timeout   600;
+  proxy_send_timeout      600;
+  proxy_read_timeout      600;
+  send_timeout            600;
+  client_max_body_size    2G;
+  proxy_buffering off;
+  client_header_buffer_size 8k;
+  location / {
+    add_header              Strict-Transport-Security "max-age=31536000";
+    proxy_pass            http://n8n:5678;
+    proxy_http_version      1.1;
+  }
+}
+
+------------------------------------------
+
+server {
+  listen 443 ssl;
+  server_name thehive.acds.net.in;
+  access_log /var/log/nginx/thehive.access.log main;
+  error_log /var/log/nginx/thehive.error.log;
+  proxy_connect_timeout   600;
+  proxy_send_timeout      600;
+  proxy_read_timeout      600;
+  send_timeout            600;
+  client_max_body_size    2G;
+  proxy_buffering off;
+  client_header_buffer_size 8k;
+  location / {
+    add_header              Strict-Transport-Security "max-age=31536000";
+    proxy_pass            http://thehive-in:9000;
+    proxy_http_version      1.1;
+  }
+}
+
+--------------------------------
+
+rm nginxcerts
+mkdir nginxcerts
+sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout nginxcerts/nginx-selfsigned.key -out nginxcerts/nginx-selfsigned.crt
+echo "Self signed certificate and key generated at location: " $PWD/nginxcerts 
+
+-------------------------------------
+
+MISP_TAG=v2.4.153
+HOSTNAME=tip
+HOSTIP=127.0.0.1
+PHP_VER=20190902
+CORE_VERSION=core-$(MISP_TAG)a
+MODULES_VERSION=modules-$(MISP_TAG)a
+SMTP_VERSION=latest
+MYSQL_VERSION=8.0.19
+REDIS_VERSION=5.0.6
+WEBSERVER_VERSION=latest
+ALIENVAULT_VERSION=1.0
+HAILATAXII_VERSION=1.0
+OTX_VERSION=1.0
+ANONYMIZATION_VERSION=1.0
+ALERTS_VERSION=1.0
+QRADAR_CONNECTOR_VERSION=1.0
+VULNERABILITY_SERVER_VERSION=1.0
+SDL_CONNECTOR_VERSION=1.0
+MAIL_TO_MISP_VERSION=1.0
+SECTOR=Telecommunications
+ORGNAME=etip1
+BUILD_DIR=build
+OUT_DIR=release/
+DOCKERHUB_REGISTRY=docker.acds.net.in/dockerhubproxy
+ACDS_REGISTRY=docker.acds.net.in/tip-ccm
+ifneq ($(BUILD_NUMBER),)
+ACDS_VERSION=_$(BUILD_NUMBER)
+else
+ACDS_VERSION=
+endif
+TIP_TAR=MISP_$(MISP_TAG)$(ACDS_VERSION).tar.gz
+DOCKER_DIR=docker/docker-misp
+TMP_DOCKER_DIR=misp_tmp
+all: clean build
+build: 
+	echo "Starting build $(BUILD_NUMBER)"
+	mkdir -p $(BUILD_DIR); mkdir -p $(OUT_DIR);
+	cp -r development $(DOCKER_DIR)/server/
+	cp -r development/misp-objects/acds-entity-risk-report/ $(DOCKER_DIR)/server/development/misp/app/files/misp-objects/objects/
+	cp -r development/misp-modules $(DOCKER_DIR)/modules/
+	cp -r applications/taxii_to_misp/taxii $(DOCKER_DIR)/hailataxiidocker/
+	cp -r applications/taxii_to_misp/taxii $(DOCKER_DIR)/alienvaulttaxiidocker/
+	cp -r applications/Anonymization/anonymize $(DOCKER_DIR)/anonymizedocker/
+	cp -r applications/otx_ingestion/otx $(DOCKER_DIR)/otxdocker/
+	cp -r applications/PolicyNotification/policynotification $(DOCKER_DIR)/server/
+	cp -r applications/qradar-connector $(DOCKER_DIR)/qradar-connectordocker/
+	cp -r applications/HealthCheck/healthcheck $(DOCKER_DIR)/server/
+	cp -r applications/VulnerabilityServer $(DOCKER_DIR)/
+	cp -r applications/sdlconnector $(DOCKER_DIR)/sdlconnectordocker
+	cp -r applications/AdvisoryIngestion/Email $(DOCKER_DIR)/mailtomispdocker
+	cp -r applications/AdvisoryIngestion/mailtomisp $(DOCKER_DIR)/mailtomispdocker
+	cp -r applications/AdvisoryIngestion/nciipc_email $(DOCKER_DIR)/mailtomispdocker
+	cp -r applications/AdvisoryIngestion/plaintext $(DOCKER_DIR)/mailtomispdocker
+	# create new folder inside docker_misp, for misp_alerts
+	cp -r applications/Alerts $(DOCKER_DIR)/alertsdocker/
+	echo "MISP_TAG=$(MISP_TAG)" > $(DOCKER_DIR)/.env
+	echo "PHP_VER=$(PHP_VER)" >> $(DOCKER_DIR)/.env
+	echo "MISPCORE_TAG=$(CORE_VERSION)" >> $(DOCKER_DIR)/.env
+	echo "MODULES_TAG=$(MODULES_VERSION)" >> $(DOCKER_DIR)/.env
+	echo "HOSTNAME=$(HOSTNAME)" >> $(DOCKER_DIR)/.env
+	echo "HOSTIP=$(HOSTIP)" >> $(DOCKER_DIR)/.env
+	echo "REGISTRY=$(DOCKERHUB_REGISTRY)" >> $(DOCKER_DIR)/.env
+	echo "ALIENVAULT_VERSION=$(ALIENVAULT_VERSION)" >> $(DOCKER_DIR)/.env
+	echo "HAILATAXII_VERSION=$(HAILATAXII_VERSION)" >> $(DOCKER_DIR)/.env
+	echo "OTX_VERSION=$(OTX_VERSION)" >> $(DOCKER_DIR)/.env
+	echo "ANONYMIZATION_VERSION=$(ANONYMIZATION_VERSION)" >> $(DOCKER_DIR)/.env
+	echo "VULNERABILITY_SERVER_VERSION=$(VULNERABILITY_SERVER_VERSION)" >> $(DOCKER_DIR)/.env
+	echo "QRADAR_CONNECTOR_VERSION=$(QRADAR_CONNECTOR_VERSION)" >> $(DOCKER_DIR)/.env
+	echo "SDL_CONNECTOR_VERSION=$(SDL_CONNECTOR_VERSION)" >> $(DOCKER_DIR)/.env
+	echo "MAIL_TO_MISP_VERSION=$(MAIL_TO_MISP_VERSION)" >> $(DOCKER_DIR)/.env
+	echo "SECTOR=$(SECTOR)" >> $(DOCKER_DIR)/.env
+	echo "ORGNAME=$(ORGNAME)" >> $(DOCKER_DIR)/.env
+	# git add .env and then push hidden files
+	echo "ALERTS_VERSION=$(ALERTS_VERSION)" >> $(DOCKER_DIR)/.env
+	cp -a $(DOCKER_DIR) $(TMP_DOCKER_DIR); cd $(TMP_DOCKER_DIR);  docker-compose -f build-docker-compose.yml build
+	cd $(TMP_DOCKER_DIR);  docker-compose up -d
+	docker commit $$( docker ps | grep _misp_1 | grep -v to_misp_1 | awk '{print $$1}') $(ACDS_REGISTRY)/coolacid/misp-docker:$(CORE_VERSION)$(ACDS_VERSION)
+	docker commit $$( docker ps | grep misp-modules_1 | awk '{print $$1}') $(ACDS_REGISTRY)/coolacid/misp-docker:$(MODULES_VERSION)$(ACDS_VERSION)
+	docker tag $(DOCKERHUB_REGISTRY)/namshi/smtp:$(SMTP_VERSION) $(ACDS_REGISTRY)/namshi/smtp:$(SMTP_VERSION)
+	docker tag $(DOCKERHUB_REGISTRY)/library/redis:$(REDIS_VERSION) $(ACDS_REGISTRY)/library/redis:$(REDIS_VERSION)
+	docker tag $(DOCKERHUB_REGISTRY)/library/mysql:$(MYSQL_VERSION) $(ACDS_REGISTRY)/library/mysql:$(MYSQL_VERSION)
+	docker tag $(DOCKERHUB_REGISTRY)/library/httpd:$(WEBSERVER_VERSION) $(ACDS_REGISTRY)/library/httpd:$(WEBSERVER_VERSION)
+	docker tag $(DOCKERHUB_REGISTRY)/alienvault:$(ALIENVAULT_VERSION) $(ACDS_REGISTRY)/alienvault:$(ALIENVAULT_VERSION)
+	docker tag $(DOCKERHUB_REGISTRY)/hailataxii:$(HAILATAXII_VERSION) $(ACDS_REGISTRY)/hailataxii:$(HAILATAXII_VERSION)
+	docker tag $(DOCKERHUB_REGISTRY)/otx:$(OTX_VERSION) $(ACDS_REGISTRY)/otx:$(OTX_VERSION)
+	docker tag $(DOCKERHUB_REGISTRY)/anonymization:$(ANONYMIZATION_VERSION) $(ACDS_REGISTRY)/anonymization:$(ANONYMIZATION_VERSION)
+	docker tag $(DOCKERHUB_REGISTRY)/alerts:$(ALERTS_VERSION) $(ACDS_REGISTRY)/alerts:$(ALERTS_VERSION)
+	docker tag $(DOCKERHUB_REGISTRY)/vulnerability_server:$(VULNERABILITY_SERVER_VERSION) $(ACDS_REGISTRY)/vulnerability_server:$(VULNERABILITY_SERVER_VERSION)
+	docker tag $(DOCKERHUB_REGISTRY)/qradar-connector:$(QRADAR_CONNECTOR_VERSION) $(ACDS_REGISTRY)/qradar-connector:$(QRADAR_CONNECTOR_VERSION)$(ACDS_VERSION)
+	docker tag $(DOCKERHUB_REGISTRY)/sdl_connector:$(SDL_CONNECTOR_VERSION) $(ACDS_REGISTRY)/sdl_connector:$(SDL_CONNECTOR_VERSION)
+	docker tag $(DOCKERHUB_REGISTRY)/mail_to_misp:$(MAIL_TO_MISP_VERSION) $(ACDS_REGISTRY)/mail_to_misp:$(MAIL_TO_MISP_VERSION)
+	
+	docker image save -o $(BUILD_DIR)/misp_$(MODULES_VERSION).tar $(ACDS_REGISTRY)/coolacid/misp-docker:$(MODULES_VERSION)$(ACDS_VERSION)
+	docker image save -o $(BUILD_DIR)/misp_$(CORE_VERSION).tar $(ACDS_REGISTRY)/coolacid/misp-docker:$(CORE_VERSION)$(ACDS_VERSION)
+	docker image save -o $(BUILD_DIR)/smtp.tar $(ACDS_REGISTRY)/namshi/smtp:$(SMTP_VERSION)
+	docker image save -o $(BUILD_DIR)/redis.tar  $(ACDS_REGISTRY)/library/redis:$(REDIS_VERSION)
+	docker image save -o $(BUILD_DIR)/mysql.tar  $(ACDS_REGISTRY)/library/mysql:$(MYSQL_VERSION)
+	docker image save -o $(BUILD_DIR)/webserver.tar  $(ACDS_REGISTRY)/library/httpd:$(WEBSERVER_VERSION)
+	docker image save -o $(BUILD_DIR)/alienvault.tar  $(ACDS_REGISTRY)/alienvault:$(ALIENVAULT_VERSION)
+	docker image save -o $(BUILD_DIR)/hailataxii.tar  $(ACDS_REGISTRY)/hailataxii:$(HAILATAXII_VERSION)
+	docker image save -o $(BUILD_DIR)/otx.tar  $(ACDS_REGISTRY)/otx:$(OTX_VERSION)
+	docker image save -o $(BUILD_DIR)/anonymize.tar  $(ACDS_REGISTRY)/anonymization:$(ANONYMIZATION_VERSION)
+	docker image save -o $(BUILD_DIR)/alerts.tar  $(ACDS_REGISTRY)/alerts:$(ALERTS_VERSION)
+	docker image save -o $(BUILD_DIR)/vulnerability_server.tar  $(ACDS_REGISTRY)/vulnerability_server:$(VULNERABILITY_SERVER_VERSION)
+	docker image save -o $(BUILD_DIR)/qradar-connector.tar $(ACDS_REGISTRY)/qradar-connector:$(QRADAR_CONNECTOR_VERSION)$(ACDS_VERSION)
+	docker image save -o $(BUILD_DIR)/sdl_connector.tar  $(ACDS_REGISTRY)/sdl_connector:$(SDL_CONNECTOR_VERSION)
+	docker image save -o $(BUILD_DIR)/mail_to_misp.tar  $(ACDS_REGISTRY)/mail_to_misp:$(MAIL_TO_MISP_VERSION)
+	cd $(BUILD_DIR);  tar -czvf $(TIP_TAR) misp_$(CORE_VERSION).tar misp_$(MODULES_VERSION).tar redis.tar smtp.tar mysql.tar webserver.tar alienvault.tar hailataxii.tar otx.tar anonymize.tar alerts.tar vulnerability_server.tar qradar-connector.tar sdl_connector.tar mail_to_misp.tar
+	# Make the files and folder Available as artifacts
+	mv $(BUILD_DIR)/*.tar.gz $(OUT_DIR)/
+	cp -r $(DOCKER_DIR) $(OUT_DIR)/
+	echo "MISP_TAG=$(MISP_TAG)" > $(OUT_DIR)/docker-misp/.env
+	echo "PHP_VER=$(PHP_VER)" >> $(OUT_DIR)/docker-misp/.env
+	echo "MISPCORE_TAG=$(CORE_VERSION)$(ACDS_VERSION)" >> $(OUT_DIR)/docker-misp/.env
+	echo "MODULES_TAG=$(MODULES_VERSION)$(ACDS_VERSION)" >> $(OUT_DIR)/docker-misp/.env
+	echo "HOSTNAME=$(HOSTNAME)" >> $(OUT_DIR)/docker-misp/.env
+	echo "HOSTIP=$(HOSTIP)" >> $(OUT_DIR)/docker-misp/.env
+	echo "REGISTRY=$(ACDS_REGISTRY)" >> $(OUT_DIR)/docker-misp/.env
+	echo "ALIENVAULT_VERSION=$(ALIENVAULT_VERSION)" >> $(OUT_DIR)/docker-misp/.env
+	echo "HAILATAXII_VERSION=$(HAILATAXII_VERSION)" >> $(OUT_DIR)/docker-misp/.env
+	echo "OTX_VERSION=$(OTX_VERSION)" >> $(OUT_DIR)/docker-misp/.env
+	echo "ANONYMIZATION_VERSION=$(ANONYMIZATION_VERSION)" >> $(OUT_DIR)/docker-misp/.env
+	echo "ALERTS_VERSION=$(ALERTS_VERSION)" >> $(OUT_DIR)/docker-misp/.env
+	echo "VULNERABILITY_SERVER_VERSION=$(VULNERABILITY_SERVER_VERSION)" >> $(OUT_DIR)/docker-misp/.env
+	echo "QRADAR_CONNECTOR_VERSION=$(QRADAR_CONNECTOR_VERSION)$(ACDS_VERSION)" >> $(OUT_DIR)/docker-misp/.env
+	echo "SDL_CONNECTOR_VERSION=$(SDL_CONNECTOR_VERSION)" >> $(OUT_DIR)/docker-misp/.env
+	echo "MAIL_TO_MISP_VERSION=$(MAIL_TO_MISP_VERSION)" >> $(OUT_DIR)/docker-misp/.env
+	echo "SECTOR=$(SECTOR)" >> $(OUT_DIR)/docker-misp/.env
+	echo "ORGNAME=$(ORGNAME)" >> $(OUT_DIR)/docker-misp/.env
+	cp docker/deploy_misp.sh $(OUT_DIR)/
+	cp docker/prerequisite.sh $(OUT_DIR)/
+	cp -r applications $(OUT_DIR)/
+	cp -r configuration $(OUT_DIR)/
+	rm -rf $(OUT_DIR)/docker-misp/modules;
+	rm -rf $(OUT_DIR)/docker-misp/server;
+	rm -rf $(OUT_DIR)/docker-misp/alienvaulttaxiidocker;
+	rm -rf $(OUT_DIR)/docker-misp/anonymizedocker;
+	rm -rf $(OUT_DIR)/docker-misp/hailataxiidocker;
+	rm -rf $(OUT_DIR)/docker-misp/otxdocker;
+	rm -rf $(OUT_DIR)/docker-misp/alertsdocker;
+	rm -rf $(OUT_DIR)/docker-misp/VulnerabilityServer;
+	rm -rf $(OUT_DIR)/docker-misp/qradar-connectordocker;
+	rm -rf $(OUT_DIR)/docker-misp/sdlconnectordocker;
+	rm -rf $(OUT_DIR)/docker-misp/mailtomispdocker;
+	# remove unused applications
+	rm -rf $(OUT_DIR)/applications/search-malware-api
+	rm -rf $(OUT_DIR)/applications/Snorts
+	rm -rf $(OUT_DIR)/applications/Webservice_AdvisoryIngestion
+	rm -rf $(OUT_DIR)/applications/Webservice_PurgeMISPData
+	rm -rf $(OUT_DIR)/applications/ibmAPI_ingestion
+	echo "MISP deployment bundle " $(OUT_DIR)/$(TIP_TAR) "generated successfully."
+release:
+	# Push the images to docker registry
+	echo "Pushing docker images to registry...."
+	docker push $(ACDS_REGISTRY)/namshi/smtp:$(SMTP_VERSION)
+	docker push $(ACDS_REGISTRY)/library/redis:$(REDIS_VERSION)
+	docker push $(ACDS_REGISTRY)/library/mysql:$(MYSQL_VERSION)
+	docker push $(ACDS_REGISTRY)/library/httpd:$(WEBSERVER_VERSION)
+	docker push $(ACDS_REGISTRY)/coolacid/misp-docker:$(MODULES_VERSION)$(ACDS_VERSION)
+	docker push $(ACDS_REGISTRY)/coolacid/misp-docker:$(CORE_VERSION)$(ACDS_VERSION)
+	echo "Pushing plugin images to registry...."
+	docker push $(ACDS_REGISTRY)/alienvault:$(ALIENVAULT_VERSION)
+	docker push $(ACDS_REGISTRY)/hailataxii:$(HAILATAXII_VERSION)
+	docker push $(ACDS_REGISTRY)/otx:$(OTX_VERSION)
+	docker push $(ACDS_REGISTRY)/anonymization:$(ANONYMIZATION_VERSION)
+	docker push $(ACDS_REGISTRY)/alerts:$(ALERTS_VERSION)
+	docker push $(ACDS_REGISTRY)/vulnerability_server:$(VULNERABILITY_SERVER_VERSION)
+	docker push $(ACDS_REGISTRY)/qradar-connector:$(QRADAR_CONNECTOR_VERSION)$(ACDS_VERSION)
+	docker push $(ACDS_REGISTRY)/sdl_connector:$(SDL_CONNECTOR_VERSION)
+	docker push $(ACDS_REGISTRY)/mail_to_misp:$(MAIL_TO_MISP_VERSION)
+	echo "Images successfully pushed to registry."
+clean:
+	rm -rf $(BUILD_DIR);
+	rm -rf $(DOCKER_DIR)/server/development;
+	rm -rf $(DOCKER_DIR)/modules/misp-modules;
+	rm -rf $(DOCKER_DIR)/alienvaulttaxiidocker/taxii;
+	rm -rf $(DOCKER_DIR)/anonymizedocker/anonymize	
+	rm -rf $(DOCKER_DIR)/server/policynotification
+	rm -rf $(DOCKER_DIR)/server/healthcheck
+	rm -rf $(DOCKER_DIR)/hailataxiidocker/taxii
+	rm -rf $(DOCKER_DIR)/otxdocker/otx
+	rm -rf $(DOCKER_DIR)/alertsdocker/Alerts
+	rm -rf $(DOCKER_DIR)/VulnerabilityServer
+	rm -rf $(DOCKER_DIR)/qradar-connectordocker/qradar-connector
+	rm -rf $(DOCKER_DIR)/sdlconnectordocker/sdlconnector
+	rm -rf $(DOCKER_DIR)/mailtomispdocker/Email
+	rm -rf $(DOCKER_DIR)/mailtomispdocker/mailtomisp
+	rm -rf $(DOCKER_DIR)/mailtomispdocker/nciipc_email
+	rm -rf $(DOCKER_DIR)/mailtomispdocker/plaintext
+	[ -e $(TMP_DOCKER_DIR)/docker-compose.yml ] && ( cd $(TMP_DOCKER_DIR); docker-compose down -v --rmi all --remove-orphans; echo SUCCESS ) || echo "No docker-compose.yml to clean"
+	docker image prune -f
+	# Remove temp docker folder
+	sudo rm -rf $(TMP_DOCKER_DIR)
+cleanall:
+	# stop all containers
+	( docker container stop $$(docker container ls -aq) ) && ( echo "Stopped Containers" )
+	# remove all containers
+	( docker container rm $$(docker container ls -aq) ) && ( echo "Removed Containers" )
+	# remove all images
+	( docker rmi -f $$(docker images -a -q) ) && ( echo "Removed Images" )
+	# remove all volumes
+	( docker volume rm $$(docker volume ls -q) ) && ( echo "Remove Volumes" )
+.PHONY: clean build release all
+------------------------------------------------
+if [ $# -lt 1 ]; then 
+    echo "Usage : ./configure_email.sh <conf_type:smtp or mail>"
+    exit 
+fi
+BACK_DIR="$PWD/backup_config"
+if [ ! -d "$BACK_DIR" ] 
+then
+	mkdir $BACK_DIR
+fi
+MAIL_CONTAINER_NAME="$(sudo docker ps --format {{.Names}} | grep _mail_1 | awk '{print $1}')"
+echo $MAIL_CONTAINER_NAME
+MISP_CONTAINERID="$(sudo docker ps | grep _misp_1 | grep -v to_misp_1 | awk '{print $1}')"
+echo $MISP_CONTAINERID
+FILE="$BACK_DIR/email.php.bak"
+if test -f "$FILE"; then
+    echo "Backup File $FILE exists."
+	sudo docker cp $FILE $MISP_CONTAINERID:/var/www/MISP/app/Config/email.php
+	sudo docker exec -it $MISP_CONTAINERID bash -c  "sudo chown www-data /var/www/MISP/app/Config/email.php"
+	sudo docker exec -it $MISP_CONTAINERID bash -c  "sudo chgrp www-data /var/www/MISP/app/Config/email.php"
+else 
+	echo "Backing up of email.php to email.php.bak."
+	sudo docker cp $MISP_CONTAINERID:/var/www/MISP/app/Config/email.php $FILE
+fi
+echo "Changing config file /var/www/MISP/app/Config/email.php .."
+sudo docker exec -it $MISP_CONTAINERID bash -c "sed -i \"s/default = array/Mail = array/g\" /var/www/MISP/app/Config/email.php"
+sudo docker exec -it $MISP_CONTAINERID bash -c "sed -i \"s/smtp = array/default = array/g\" /var/www/MISP/app/Config/email.php"
+SRC_HOST="'localhost'"
+SRC_DEST="'"$MAIL_CONTAINER_NAME"'"
+sudo docker exec -it $MISP_CONTAINERID bash -c "sed -i \"s/$SRC_HOST/$SRC_DEST/g\" /var/www/MISP/app/Config/email.php"
+FROM_SRC="'from'"
+FROM_DST="//'from'"
+sudo docker exec -it $MISP_CONTAINERID bash -c "sed -i \"s|$FROM_SRC|$FROM_DST|g\" /var/www/MISP/app/Config/email.php"
+FROM_SRC="'username'"
+FROM_DST="//'username'"
+sudo docker exec -it $MISP_CONTAINERID bash -c "sed -i \"s|$FROM_SRC|$FROM_DST|g\" /var/www/MISP/app/Config/email.php"
+FROM_SRC="'password'"
+FROM_DST="//'password'"
+sudo docker exec -it $MISP_CONTAINERID bash -c "sed -i \"s|$FROM_SRC|$FROM_DST|g\" /var/www/MISP/app/Config/email.php"
+echo "Configuration changed.."
+echo "Your local SMTP server will work now. \nFor Gmail Run    - configure_gmail_relay.sh \nFor PSL SMTP Run - configure_smtp_relay.sh"
+
+
+-----------------------------------------------
+if [ $# -lt 2 ]; then 
+    echo "Usage : ./configure_gmail_relay.sh <Gmail_user> <Gmail_password>"
+    exit 
+fi
+BACK_DIR="$PWD/backup_config"
+if [ ! -d "$BACK_DIR" ] 
+then
+	mkdir $BACK_DIR
+fi
+CREDENTIALS=*.gmail.com:$1:$(printf '%s' $2 | sed -e 's/[\/&]/\\&/g')
+#echo $CREDENTIALS
+MISP_MAIL_CONTAINERID="$(sudo docker ps | grep _mail_1 | awk '{print $1}')"
+echo $MISP_MAIL_CONTAINERID
+FILE="$BACK_DIR/update-exim4.conf.conf.bak"
+if test -f "$FILE"; then
+    echo "Backup File $FILE exists."
+	sudo docker cp "$BACK_DIR/update-exim4.conf.conf.bak" $MISP_MAIL_CONTAINERID:/etc/exim4/update-exim4.conf.conf
+else 
+	echo "Backing up configurations..."
+	sudo docker cp $MISP_MAIL_CONTAINERID:/etc/exim4/update-exim4.conf.conf "$BACK_DIR/update-exim4.conf.conf.bak"
+	echo "Done."
+fi
+echo "Configuring credentials .."
+sudo docker exec -it $MISP_MAIL_CONTAINERID bash -c "echo $CREDENTIALS > /etc/exim4/passwd.client"
+echo "Configuring smtp configs .."
+SRC_TYPE="'internet'"
+DEST_TYPE="'smarthost'"
+sudo docker exec -it $MISP_MAIL_CONTAINERID bash -c "sed -i \"s/$SRC_TYPE/$DEST_TYPE/g\" /etc/exim4/update-exim4.conf.conf"
+SRC_HOST="dc_smarthost=''"
+SRC_DEST="dc_smarthost='smtp.gmail.com::587'"
+sudo docker exec -it $MISP_MAIL_CONTAINERID bash -c "sed -i \"s/$SRC_HOST/$SRC_DEST/g\" /etc/exim4/update-exim4.conf.conf"
+echo "Update exim4 config .."
+sudo docker exec -it $MISP_MAIL_CONTAINERID bash -c  "update-exim4.conf"
+#sudo docker exec -it $MISP_MAIL_CONTAINERID bash -c  "service exim4 restart"
+echo "Gmail configuration completed."
+
+
+----------------------------------------------
+version: '3'
+services:
+  misp:
+    image: ${REGISTRY}/coolacid/misp-docker:${MISPCORE_TAG}
+    build:
+        context: server/.
+        args:
+            - MISP_TAG=${MISP_TAG}
+            - PHP_VER=${PHP_VER}
+  misp-modules:
+    image: ${REGISTRY}/coolacid/misp-docker:${MODULES_TAG}
+    build:
+        context: modules/.
+        args:
+            - MODULES_TAG=${MISP_TAG}
+       
+  alienvault:
+    image: ${REGISTRY}/alienvault:${ALIENVAULT_VERSION}
+    build:
+        context: alienvaulttaxiidocker/.
+       
+  hailataxii:
+    image: ${REGISTRY}/hailataxii:${HAILATAXII_VERSION}
+    build:
+        context: hailataxiidocker/.
+       
+  otx:
+    image: ${REGISTRY}/otx:${OTX_VERSION}
+    build:
+        context: otxdocker/.
+       
+  anonymization:
+    image: ${REGISTRY}/anonymization:${ANONYMIZATION_VERSION}
+    build:
+        context: anonymizedocker/.
+  alerts:
+    image: ${REGISTRY}/alerts:${ALERTS_VERSION}
+    build:
+      context: alertsdocker/.
+      
+  vulnerability-api:
+    image: ${REGISTRY}/vulnerability_server:${VULNERABILITY_SERVER_VERSION}
+    build:
+        context: VulnerabilityServer/.
+        
+  qradar-connector:
+    image: ${REGISTRY}/qradar-connector:${QRADAR_CONNECTOR_VERSION}
+    build:
+        context: qradar-connectordocker/.
+        
+  sdl_connector:
+    image: ${REGISTRY}/sdl_connector:${SDL_CONNECTOR_VERSION}
+    build:
+        context: sdlconnectordocker/.
+        
+  mail_to_misp:
+    image: ${REGISTRY}/mail_to_misp:${MAIL_TO_MISP_VERSION}
+    build:
+        context: mailtomispdocker/.
+------------------------------------------
+FROM python:3.8-slim-buster
+WORKDIR /Alerts/
+COPY Alerts /Alerts/
+RUN apt-get update; apt-get install -y --no-install-recommends \
+        # Requirements:
+        supervisor \
+        git \
+        cron \
+        && apt-get autoremove -y && apt-get clean -y && rm -rf /var/lib/apt/lists/*
+RUN pip3 install pytz pymisp pyyaml dxlclient dxlbootstrap
+RUN ln -snf /usr/share/zoneinfo/Asia/Kolkata /etc/localtime
+RUN echo Asia/Kolkata > /etc/timezone
+COPY files/entrypoint_alerts.sh /
+COPY files/entrypoint.sh /
+COPY files/etc/supervisor/supervisor.conf /etc/supervisor/conf.d/supervisord.conf
+ENTRYPOINT [ "/entrypoint.sh" ]
+
+-------------------------------------------------
+#!/bin/bash
+# Connect Alerts notification to dxl service
+echo "Starting Keywords Notification Alerts to dxl service from entrypoint...."
+echo "Start Alerts after 1 min"
+sleep 100
+echo "INFO : Creating CronJob for 1am...."
+bash /Alerts/crontab.sh
+if [ $? != 0 ]; then
+        echo "ERROR : Error in Creating cronjob for Alerts in docker"
+        echo "INFO : END EXECUTION......."
+        exit 1
+fi
+echo "INFO : END EXECUTION......."
+cron -f -l &
+python_path="`which python3`"
+$python_path /Alerts/alerts_to_dxl.py &
+if [ $? != 0 ]; then
+  echo "INFO : Received exit signal from alert notification in docker"
+	echo "INFO : Check policy_change_notification logs under logs"
+  echo "INFO : END EXECUTION......."
+fi
+echo "Started Alerts to dxl service"
+---------------------------------------
+FROM python:3.8-slim-buster
+WORKDIR /taxii/
+COPY taxii /taxii/
+RUN apt-get update; apt-get install -y --no-install-recommends \
+        # Requirements:
+        supervisor \
+        git \
+        cron \
+        && apt-get autoremove -y && apt-get clean -y && rm -rf /var/lib/apt/lists/*
+RUN pip3 install cabby libtaxii pytz requests pymisp
+RUN ln -snf /usr/share/zoneinfo/Asia/Kolkata /etc/localtime
+RUN echo Asia/Kolkata > /etc/timezone
+COPY files/entrypoint_alienvault.sh /
+COPY files/entrypoint.sh /
+COPY files/etc/supervisor/supervisor.conf /etc/supervisor/conf.d/supervisord.conf
+ENTRYPOINT [ "/entrypoint.sh" ]
+-------------------------------------------------
+FROM python:3.8-slim-buster
+WORKDIR /anonymize/
+COPY anonymize /anonymize/
+RUN apt-get update; apt-get install -y --no-install-recommends \
+        # Requirements:
+        supervisor \
+        git \
+        cron \
+        && apt-get autoremove -y && apt-get clean -y && rm -rf /var/lib/apt/lists/*
+RUN pip3 install IPy pycryptodome pycryptodome-test-vectors pytz pycryptodomex pymisp validators pyyaml yacryptopan sklearn kneed numpy
+RUN ln -snf /usr/share/zoneinfo/Asia/Kolkata /etc/localtime
+RUN echo Asia/Kolkata > /etc/timezone
+COPY files/entrypoint_anonymization.sh /
+COPY files/entrypoint.sh /
+COPY files/etc/supervisor/supervisor.conf /etc/supervisor/conf.d/supervisord.conf
+ENTRYPOINT [ "/entrypoint.sh" ]
+--------------------------------------------------
+FROM python:3.8-slim-buster
+WORKDIR /otx/
+COPY otx /otx/
+RUN apt-get update; apt-get install -y --no-install-recommends \
+        # Requirements:
+        supervisor \
+        git \
+        cron \
+        && apt-get autoremove -y && apt-get clean -y && rm -rf /var/lib/apt/lists/*
+RUN pip3 install pytz requests pymisp validators
+RUN ln -snf /usr/share/zoneinfo/Asia/Kolkata /etc/localtime
+RUN echo Asia/Kolkata > /etc/timezone
+COPY files/entrypoint_otx.sh /
+COPY files/entrypoint.sh /
+COPY files/etc/supervisor/supervisor.conf /etc/supervisor/conf.d/supervisord.conf
+ENTRYPOINT [ "/entrypoint.sh" ]
+
+-------------------------------------
+
